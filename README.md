@@ -1,37 +1,46 @@
-# OpenJev Playground
+# OpenJev
 
-A **TanStack-style / Vite + React** playground that mirrors [TypeSafe AI’s Jev](https://docs.typesafe.ai) `/v1/systemone` interface using any **OpenAI-compatible** structured-output LLM (OpenAI, Cerebras, Groq, Together, local vLLM, Puter, etc.).
+Open approximation of [TypeSafe Jev](https://docs.typesafe.ai) — a **System One** style decision engine.
 
-Port of the Python `openjev.evaluate` script to TypeScript, with:
+Instead of one flaky “return a giant JSON blob” call, OpenJev uses a **parallel sampler**:
 
-- **REST API**: `POST /api/evaluate`
-- **Playground UI** similar to the TypeSafe console playground (state + typed questions → calibrated answers)
+1. **Fixed answer space** — no free-form text generation
+2. **Each option scored independently** against the same state
+3. **Scores normalized** (logit → softmax) into a probability distribution
+4. **All questions run in parallel** (`Promise.all`)
+
+That mirrors how Jev is described: parallel evaluation over a declared answer set, not sequential token generation.
 
 ## Quick start
 
 ```bash
-cd openjev-app
+cd OpenJev   # folder name; package is "OpenJev"
 npm install
 npm run dev
 ```
 
 Open **http://localhost:3001**
 
-In the header, set:
-
-| Field    | Example                                      |
-|----------|----------------------------------------------|
-| model    | `gpt-4o-mini` / `qwen-3.8-27b` / …           |
-| base url | `https://api.openai.com/v1` (or leave empty) |
-| api key  | your provider key                            |
-
-Or set env vars before starting:
+| Field    | Example                            |
+|----------|------------------------------------|
+| mode     | `parallel` (default) or `oneshot`  |
+| model    | `gpt-4o-mini`, `qwen-3.8-27b`, …   |
+| base url | provider base, or empty for OpenAI |
+| api key  | your key                           |
 
 ```bash
 export OPENAI_API_KEY=sk-...
-# or CEREBRAS_API_KEY / PUTER_API_KEY
 npm run dev
 ```
+
+## Why parallel mode is more reliable
+
+| Mode | Behavior | Failure mode |
+|------|----------|--------------|
+| **parallel** (default) | One tiny `{"p": 0–1}` call **per option**, then softmax | Rare — each call is tiny and constrained |
+| **oneshot** | One big structured JSON for all questions | Model drops keys, invents labels, invalid JSON |
+
+Example: choice with 4 options → 4 parallel micro-calls. Score with 4 levels → same. Noul → 1 call. Questions themselves also run in parallel.
 
 ## API
 
@@ -42,36 +51,33 @@ Content-Type: application/json
 
 ```json
 {
-  "state": "Customer says: charged twice again, second month in a row!",
+  "state": "Charged twice again!! Second month in a row.",
+  "mode": "parallel",
   "questions": {
     "department": {
       "type": "choice",
       "instructions": "Which team should handle this?",
       "criteria": {
-        "billing": "Payments, invoices, refunds",
-        "technical": "Bugs, outages, login issues",
-        "sales": "Pricing, upgrades",
-        "other": "Anything else"
+        "billing": "Charges, refunds, invoices",
+        "technical": "Bugs or product issues",
+        "other": "Doesn't fit"
       }
     },
     "urgency": {
       "type": "score",
-      "instructions": "How urgent is this?",
+      "instructions": "How urgent?",
       "criteria": ["Low", "Medium", "High", "Critical"]
     },
-    "escalate": {
+    "angry": {
       "type": "noul",
-      "instructions": "Should a human review this immediately?"
+      "instructions": "Strong frustration or anger?"
     }
   },
-  "model": "gpt-4o-mini",
-  "base_url": "https://api.openai.com/v1",
-  "api_key": "sk-...",
-  "temperature": 0
+  "model": "gpt-4o-mini"
 }
 ```
 
-Response shape (same spirit as TypeSafe):
+Response includes full distributions + meta:
 
 ```json
 {
@@ -80,65 +86,38 @@ Response shape (same spirit as TypeSafe):
     "department": {
       "type": "choice",
       "choice": "billing",
-      "confidence": 0.91,
-      "probabilities": { "billing": 0.91 }
+      "confidence": 0.82,
+      "probabilities": { "billing": 0.71, "technical": 0.12, "other": 0.17 }
     },
     "urgency": {
       "type": "score",
-      "score": 2.3,
-      "confidence": 0.8,
-      "legend": { "0": "Low", "1": "Medium", "2": "High", "3": "Critical" }
+      "score": 2.4,
+      "confidence": 0.75,
+      "legend": { "0": "Low", "1": "Medium", "2": "High", "3": "Critical" },
+      "probabilities": { "0": 0.05, "1": 0.15, "2": 0.45, "3": 0.35 }
     },
-    "escalate": {
-      "type": "noul",
-      "noul": 0.72
-    }
+    "angry": { "type": "noul", "noul": 0.88 }
   },
-  "usage": {
-    "input_tokens": 412,
-    "output_tokens": 48
-  }
+  "usage": { "input_tokens": 1840, "output_tokens": 96 },
+  "meta": { "mode": "parallel", "latency_ms": 620, "parallel_calls": 9 }
 }
 ```
 
-## Question types
+## How scoring works
 
-| type     | Returns                                      |
-|----------|----------------------------------------------|
-| `choice` | `choice` + `confidence` + `probabilities`    |
-| `score`  | float `score` (can interpolate) + `confidence` + `legend` |
-| `noul` / `boolean` | `noul` ∈ [0, 1] probability             |
-
-## Project layout
+For each candidate (choice key or score level):
 
 ```
-openjev-app/
-├── server/index.ts          # Express + Vite middleware, POST /api/evaluate
-├── src/
-│   ├── lib/
-│   │   ├── evaluate.ts      # Core port of Python openjev
-│   │   └── types.ts         # Request/response + example presets
-│   ├── components/
-│   │   ├── QuestionEditor.tsx
-│   │   └── ResultsPanel.tsx
-│   ├── styles/app.css
-│   ├── App.tsx              # Playground UI
-│   └── main.tsx
-├── index.html
-├── vite.config.ts
-└── package.json
+STATEMENT = "The correct answer is <key> (<description>)."
+→ model returns { "p": 0.0 … 1.0 }
 ```
 
-## Production
+Independent `p` values → logits via `logit(p) = log(p/(1-p))` → **softmax** → distribution.
 
-```bash
-npm run build
-NODE_ENV=production npm start
-```
+- **choice** → argmax + confidence from top-1 / gap
+- **score** → expected value of the discrete distribution (interpolation allowed)
+- **noul** → single `p`
 
-## Notes
+## Not real Jev
 
-- This is an **approximation** of Jev. Real Jev is a dedicated System One model with calibrated probabilities and no text generation. Here we use a chat LLM with JSON schema / structured outputs, so confidence is model-reported, not true logprob calibration.
-- Providers that do not support `response_format: json_schema` fall back to `json_object`; the server still validates with Zod.
-- API keys entered in the UI stay in `localStorage` and are sent only with evaluate requests; the server does not persist them.
-```
+OpenJev uses ordinary chat LLMs as micro-scorers. Real Jev is a specialized System One model (RLCD, custom parallel sampler, ~70–500 ms). This is an **open architectural approximation** of the contract, not a weight-compatible reimplementation.

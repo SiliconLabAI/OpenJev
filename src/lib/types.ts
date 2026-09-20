@@ -1,4 +1,4 @@
-/** Question types matching TypeSafe Jev / openjev */
+/** OpenJev question types (Jev-compatible surface) */
 
 export type QuestionType = "choice" | "score" | "noul" | "boolean";
 
@@ -21,7 +21,6 @@ export interface NoulQuestion {
 }
 
 export type Question = ChoiceQuestion | ScoreQuestion | NoulQuestion;
-
 export type Questions = Record<string, Question>;
 
 export interface EvaluateRequest {
@@ -31,6 +30,8 @@ export interface EvaluateRequest {
   base_url?: string;
   api_key?: string;
   temperature?: number;
+  /** parallel = score each option independently (default); oneshot = single JSON blob */
+  mode?: "parallel" | "oneshot";
 }
 
 export interface ChoiceAnswer {
@@ -62,19 +63,20 @@ export interface EvaluateResponse {
     input_tokens: number | null;
     output_tokens: number | null;
   };
+  meta?: {
+    mode: "parallel" | "oneshot";
+    latency_ms: number;
+    parallel_calls: number;
+  };
   error?: string;
 }
-
-/** UI helpers */
 
 export interface QuestionDraft {
   id: string;
   name: string;
   type: QuestionType;
   instructions: string;
-  /** For choice: list of { key, description } */
   options: { key: string; description: string }[];
-  /** For score: ordered level labels */
   levels: string[];
 }
 

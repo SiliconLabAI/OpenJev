@@ -4,3 +4,4 @@ dist
 .env.local
 *.log
 .DS_Store
+.vite/*temp*

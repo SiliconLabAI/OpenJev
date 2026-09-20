@@ -6,14 +6,16 @@ interface Props {
   loading: boolean;
 }
 
-function ChoiceResult({ name, answer }: { name: string; answer: Extract<Answer, { type: "choice" }> }) {
+function ChoiceResult({
+  name,
+  answer,
+}: {
+  name: string;
+  answer: Extract<Answer, { type: "choice" }>;
+}) {
   const entries = Object.entries(answer.probabilities).sort(
     (a, b) => b[1] - a[1]
   );
-  // If only one key (our fake distribution), still show the chosen value
-  const showBars =
-    entries.length > 1 ||
-    (entries.length === 1 && entries[0][1] < 1);
 
   return (
     <div className="answer-card">
@@ -25,33 +27,18 @@ function ChoiceResult({ name, answer }: { name: string; answer: Extract<Answer, 
         </span>
       </div>
       <div className="answer-body">
-        {showBars ? (
-          entries.map(([key, p]) => (
-            <div className="prob-bar-row" key={key}>
-              <span className="prob-label">{key}</span>
-              <div className="prob-track">
-                <div
-                  className="prob-fill choice"
-                  style={{ width: `${Math.round(p * 100)}%` }}
-                />
-              </div>
-              <span className="prob-pct">{(p * 100).toFixed(0)}%</span>
-            </div>
-          ))
-        ) : (
-          <div className="prob-bar-row">
-            <span className="prob-label">{answer.choice}</span>
+        {entries.map(([key, p]) => (
+          <div className="prob-bar-row" key={key}>
+            <span className="prob-label">{key}</span>
             <div className="prob-track">
               <div
                 className="prob-fill choice"
-                style={{ width: `${Math.round(answer.confidence * 100)}%` }}
+                style={{ width: `${Math.round(p * 100)}%` }}
               />
             </div>
-            <span className="prob-pct">
-              {(answer.confidence * 100).toFixed(0)}%
-            </span>
+            <span className="prob-pct">{(p * 100).toFixed(0)}%</span>
           </div>
-        )}
+        ))}
         <div className="confidence-row">
           Confidence
           <span className="confidence-val">
@@ -63,7 +50,13 @@ function ChoiceResult({ name, answer }: { name: string; answer: Extract<Answer, 
   );
 }
 
-function ScoreResult({ name, answer }: { name: string; answer: Extract<Answer, { type: "score" }> }) {
+function ScoreResult({
+  name,
+  answer,
+}: {
+  name: string;
+  answer: Extract<Answer, { type: "score" }>;
+}) {
   const max = Math.max(
     0,
     ...Object.keys(answer.legend).map((k) => Number(k))
@@ -72,6 +65,15 @@ function ScoreResult({ name, answer }: { name: string; answer: Extract<Answer, {
     answer.legend[String(Math.round(answer.score))] ??
     answer.legend[String(Math.floor(answer.score))] ??
     "";
+
+  const probs =
+    answer.probabilities ??
+    Object.fromEntries(
+      Object.keys(answer.legend).map((k) => [
+        k,
+        Number(k) === Math.round(answer.score) ? 1 : 0,
+      ])
+    );
 
   return (
     <div className="answer-card">
@@ -86,8 +88,7 @@ function ScoreResult({ name, answer }: { name: string; answer: Extract<Answer, {
         </div>
         {label && <div className="score-legend">{label}</div>}
         {Object.entries(answer.legend).map(([k, v]) => {
-          const dist = Math.abs(answer.score - Number(k));
-          const strength = Math.max(0, 1 - dist);
+          const p = probs[k] ?? 0;
           return (
             <div className="prob-bar-row" key={k}>
               <span className="prob-label">
@@ -96,12 +97,10 @@ function ScoreResult({ name, answer }: { name: string; answer: Extract<Answer, {
               <div className="prob-track">
                 <div
                   className="prob-fill score"
-                  style={{ width: `${Math.round(strength * 100)}%` }}
+                  style={{ width: `${Math.round(p * 100)}%` }}
                 />
               </div>
-              <span className="prob-pct">
-                {Number(k) === Math.round(answer.score) ? "●" : ""}
-              </span>
+              <span className="prob-pct">{(p * 100).toFixed(0)}%</span>
             </div>
           );
         })}
@@ -116,7 +115,13 @@ function ScoreResult({ name, answer }: { name: string; answer: Extract<Answer, {
   );
 }
 
-function NoulResult({ name, answer }: { name: string; answer: Extract<Answer, { type: "noul" }> }) {
+function NoulResult({
+  name,
+  answer,
+}: {
+  name: string;
+  answer: Extract<Answer, { type: "noul" }>;
+}) {
   const pct = Math.round(answer.noul * 100);
   return (
     <div className="answer-card">
@@ -153,8 +158,14 @@ export function ResultsPanel({ result, error, loading }: Props) {
   if (loading) {
     return (
       <div className="results-empty">
-        <div className="spinner" style={{ width: 28, height: 28, borderWidth: 3 }} />
-        <div>Running evaluation…</div>
+        <div
+          className="spinner"
+          style={{ width: 28, height: 28, borderWidth: 3 }}
+        />
+        <div>Parallel sampling…</div>
+        <div style={{ fontSize: 12, color: "var(--text-dim)" }}>
+          Each option scored independently against the state
+        </div>
       </div>
     );
   }
@@ -172,11 +183,11 @@ export function ResultsPanel({ result, error, loading }: Props) {
       <div className="results-empty">
         <div className="results-empty-icon">◎</div>
         <div style={{ fontWeight: 500, color: "var(--text-muted)" }}>
-          Your decision will appear here
+          OpenJev decision will appear here
         </div>
-        <div style={{ fontSize: 13, maxWidth: 280 }}>
-          Set a state, define typed questions (choice / score / noul), then hit
-          Run.
+        <div style={{ fontSize: 13, maxWidth: 300 }}>
+          Fixed answer space · parallel sampler · no free-form generation.
+          Define state + typed questions, then run.
         </div>
       </div>
     );
@@ -194,6 +205,13 @@ export function ResultsPanel({ result, error, loading }: Props) {
 
       <div className="usage-footer">
         <span>model: {result.model}</span>
+        {result.meta && (
+          <>
+            <span>mode: {result.meta.mode}</span>
+            <span>calls: {result.meta.parallel_calls}</span>
+            <span>{result.meta.latency_ms} ms</span>
+          </>
+        )}
         {result.usage.input_tokens != null && (
           <span>in: {result.usage.input_tokens} tok</span>
         )}

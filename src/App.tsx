@@ -8,16 +8,18 @@ import {
 import { QuestionEditor, newQuestion } from "./components/QuestionEditor";
 import { ResultsPanel } from "./components/ResultsPanel";
 
-const STORAGE_KEY = "openjev-config";
+const STORAGE_KEY = "OpenJev-config";
 
 function loadConfig() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return JSON.parse(raw) as {
-      model: string;
-      baseUrl: string;
-      apiKey: string;
-    };
+    if (raw)
+      return JSON.parse(raw) as {
+        model: string;
+        baseUrl: string;
+        apiKey: string;
+        mode: "parallel" | "oneshot";
+      };
   } catch {
     /* ignore */
   }
@@ -25,6 +27,7 @@ function loadConfig() {
     model: "gpt-4o-mini",
     baseUrl: "",
     apiKey: "",
+    mode: "parallel" as const,
   };
 }
 
@@ -55,7 +58,9 @@ export function App() {
     if (!ex) return;
     setActiveExample(id);
     setState(ex.state);
-    setQuestions(ex.questions.map((q) => ({ ...q, id: q.id + "-" + Date.now() })));
+    setQuestions(
+      ex.questions.map((q) => ({ ...q, id: q.id + "-" + Date.now() }))
+    );
     setResult(null);
     setError(null);
   };
@@ -84,7 +89,7 @@ export function App() {
       try {
         parsedState = JSON.parse(state);
       } catch {
-        // keep as plain string
+        // plain string
       }
 
       const res = await fetch("/api/evaluate", {
@@ -97,6 +102,7 @@ export function App() {
           base_url: config.baseUrl || undefined,
           api_key: config.apiKey || undefined,
           temperature: 0,
+          mode: config.mode,
         }),
       });
 
@@ -117,16 +123,30 @@ export function App() {
     <div className="app">
       <header className="header">
         <div className="header-brand">
-          <div className="header-logo">J</div>
+          <div className="header-logo">OJ</div>
           <div>
-            <div className="header-title">OpenJev Playground</div>
+            <div className="header-title">OpenJev</div>
             <div className="header-sub">
-              OpenAI-compatible structured decisions
+              Parallel System One decisions · open approximation of Jev
             </div>
           </div>
         </div>
         <div className="header-spacer" />
         <div className="header-config">
+          <span className="config-label">mode</span>
+          <select
+            className="config-input"
+            value={config.mode}
+            onChange={(e) =>
+              saveConfig({
+                mode: e.target.value as "parallel" | "oneshot",
+              })
+            }
+            style={{ minWidth: 110 }}
+          >
+            <option value="parallel">parallel</option>
+            <option value="oneshot">oneshot</option>
+          </select>
           <span className="config-label">model</span>
           <input
             className="config-input"
@@ -156,7 +176,6 @@ export function App() {
       </header>
 
       <div className="main">
-        {/* LEFT: inputs */}
         <section className="panel">
           <div className="panel-header">
             <span className="panel-title">Input</span>
@@ -247,19 +266,20 @@ export function App() {
               disabled={loading}
             >
               {loading && <span className="spinner" />}
-              {loading ? "Running…" : "Run evaluate"}
+              {loading ? "Sampling…" : "Run OpenJev"}
             </button>
             <span className="run-status">
-              POST /api/evaluate · any OpenAI-compatible LLM
+              {config.mode === "parallel"
+                ? "parallel sampler · each option scored independently"
+                : "oneshot · single structured JSON call"}
             </span>
           </div>
         </section>
 
-        {/* RIGHT: results */}
         <section className="panel">
           <div className="panel-header">
             <span className="panel-title">Output</span>
-            {result && (
+            {result?.meta && (
               <span
                 style={{
                   fontSize: 11,
@@ -267,7 +287,8 @@ export function App() {
                   fontFamily: "var(--mono)",
                 }}
               >
-                {Object.keys(result.answers).length} answers
+                {result.meta.mode} · {result.meta.parallel_calls} calls ·{" "}
+                {result.meta.latency_ms} ms
               </span>
             )}
           </div>

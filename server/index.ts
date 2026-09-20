@@ -15,7 +15,11 @@ async function main() {
   app.use(cors());
   app.use(express.json({ limit: "2mb" }));
 
-  // ── REST API: POST /api/evaluate ──────────────────────────────────────
+  /**
+   * POST /api/evaluate
+   * OpenJev System One endpoint (Jev-compatible request shape).
+   * Default mode=parallel scores each option independently then normalizes.
+   */
   app.post("/api/evaluate", async (req, res) => {
     try {
       const body = req.body as EvaluateRequest;
@@ -29,7 +33,6 @@ async function main() {
         return;
       }
 
-      // Prefer client-supplied key/url, then env
       const result = await evaluate({
         state: body.state,
         questions: body.questions,
@@ -37,6 +40,7 @@ async function main() {
         base_url: body.base_url,
         api_key: body.api_key,
         temperature: body.temperature ?? 0,
+        mode: body.mode ?? "parallel",
       });
 
       res.json(result);
@@ -52,9 +56,8 @@ async function main() {
     }
   });
 
-  // Health
   app.get("/api/health", (_req, res) => {
-    res.json({ ok: true, service: "openjev" });
+    res.json({ ok: true, service: "OpenJev" });
   });
 
   if (isProd) {
@@ -63,7 +66,6 @@ async function main() {
       res.sendFile(path.join(__dirname, "../dist/index.html"));
     });
   } else {
-    // Dev: Vite middleware mode so one process serves UI + API
     const vite = await createViteServer({
       root: path.join(__dirname, ".."),
       server: { middlewareMode: true },
@@ -75,7 +77,7 @@ async function main() {
   app.listen(PORT, () => {
     console.log(`\n  OpenJev Playground`);
     console.log(`  → http://localhost:${PORT}`);
-    console.log(`  → POST /api/evaluate\n`);
+    console.log(`  → POST /api/evaluate  (parallel sampler by default)\n`);
   });
 }
 
