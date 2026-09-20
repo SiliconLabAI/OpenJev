@@ -8,7 +8,7 @@ import {
 import { QuestionEditor, newQuestion } from "./components/QuestionEditor";
 import { ResultsPanel } from "./components/ResultsPanel";
 
-const STORAGE_KEY = "OpenJev-config";
+const STORAGE_KEY = "openjev-config";
 
 function loadConfig() {
   try {
@@ -169,7 +169,7 @@ export function App() {
             type="password"
             value={config.apiKey}
             onChange={(e) => saveConfig({ apiKey: e.target.value })}
-            placeholder="sk-…"
+            placeholder="optional if set in .env"
             autoComplete="off"
           />
         </div>

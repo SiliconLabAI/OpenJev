@@ -23,15 +23,22 @@ import type {
 } from "./types";
 
 function makeClient(apiKey?: string, baseUrl?: string) {
+  const key =
+    (apiKey && apiKey.trim()) ||
+    process.env.OPENAI_API_KEY ||
+    process.env.OPENJEV_API_KEY ||
+    process.env.CEREBRAS_API_KEY ||
+    process.env.PUTER_API_KEY ||
+    process.env.GROQ_API_KEY ||
+    process.env.API_KEY;
+  if (!key) {
+    throw new Error(
+      "No API key provided. Set OPENAI_API_KEY in .env or pass api_key in the request."
+    );
+  }
   return new OpenAI({
-    apiKey:
-      apiKey ||
-      process.env.OPENAI_API_KEY ||
-      process.env.CEREBRAS_API_KEY ||
-      process.env.PUTER_API_KEY ||
-      process.env.GROQ_API_KEY ||
-      "sk-placeholder",
-    baseURL: baseUrl || undefined,
+    apiKey: key,
+    baseURL: (baseUrl && baseUrl.trim()) || process.env.OPENAI_BASE_URL || process.env.OPENJEV_BASE_URL || undefined,
   });
 }
 

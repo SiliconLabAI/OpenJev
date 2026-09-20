@@ -1,3 +1,4 @@
+import "./loadEnv";
 import express from "express";
 import cors from "cors";
 import path from "path";
@@ -10,15 +11,52 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const isProd = process.env.NODE_ENV === "production";
 const PORT = Number(process.env.PORT) || 3001;
 
+function resolveEnvKey(): string | undefined {
+  return (
+    process.env.OPENAI_API_KEY ||
+    process.env.OPENJEV_API_KEY ||
+    process.env.CEREBRAS_API_KEY ||
+    process.env.PUTER_API_KEY ||
+    process.env.GROQ_API_KEY ||
+    process.env.API_KEY ||
+    undefined
+  );
+}
+
+function resolveEnvBaseUrl(): string | undefined {
+  return (
+    process.env.OPENAI_BASE_URL ||
+    process.env.OPENJEV_BASE_URL ||
+    process.env.BASE_URL ||
+    undefined
+  );
+}
+
+function resolveEnvModel(): string | undefined {
+  return process.env.OPENJEV_MODEL || process.env.MODEL || undefined;
+}
+
 async function main() {
   const app = express();
   app.use(cors());
   app.use(express.json({ limit: "2mb" }));
 
+  // Debug: confirm .env loaded (never log the key itself)
+  const envKeyPresent = Boolean(resolveEnvKey());
+  console.log(
+    `[openjev] .env keys loaded: api_key=${envKeyPresent ? "yes" : "no"}, ` +
+      `base_url=${resolveEnvBaseUrl() ? "yes" : "no"}, ` +
+      `model=${resolveEnvModel() ?? "(default)"}`
+  );
+
   /**
    * POST /api/evaluate
    * OpenJev System One endpoint (Jev-compatible request shape).
    * Default mode=parallel scores each option independently then normalizes.
+   *
+   * API key resolution order:
+   *   1. body.api_key (from UI)
+   *   2. .env / process.env (OPENAI_API_KEY, CEREBRAS_API_KEY, …)
    */
   app.post("/api/evaluate", async (req, res) => {
     try {
@@ -33,12 +71,31 @@ async function main() {
         return;
       }
 
+      const api_key =
+        (typeof body.api_key === "string" && body.api_key.trim()) ||
+        resolveEnvKey();
+      const base_url =
+        (typeof body.base_url === "string" && body.base_url.trim()) ||
+        resolveEnvBaseUrl();
+      const model =
+        (typeof body.model === "string" && body.model.trim()) ||
+        resolveEnvModel() ||
+        "gpt-4o-mini";
+
+      if (!api_key) {
+        res.status(401).json({
+          error:
+            "No API key. Set OPENAI_API_KEY (or CEREBRAS_API_KEY / PUTER_API_KEY / GROQ_API_KEY) in .env, or paste a key in the UI.",
+        });
+        return;
+      }
+
       const result = await evaluate({
         state: body.state,
         questions: body.questions,
-        model: body.model,
-        base_url: body.base_url,
-        api_key: body.api_key,
+        model,
+        base_url,
+        api_key,
         temperature: body.temperature ?? 0,
         mode: body.mode ?? "parallel",
       });
@@ -57,7 +114,11 @@ async function main() {
   });
 
   app.get("/api/health", (_req, res) => {
-    res.json({ ok: true, service: "OpenJev" });
+    res.json({
+      ok: true,
+      service: "openjev",
+      env_key: Boolean(resolveEnvKey()),
+    });
   });
 
   if (isProd) {

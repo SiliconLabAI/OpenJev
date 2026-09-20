@@ -685,3 +685,49 @@ button {
   text-align: center;
   margin-bottom: 8px;
 }
+
+/* ── Modern scrollbars (Firefox + WebKit) ───────────────── */
+
+.panel-body,
+.main,
+.questions-list {
+  scrollbar-width: thin;
+  scrollbar-color: #3a3f4a transparent;
+}
+
+.panel-body::-webkit-scrollbar,
+.main::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.panel-body::-webkit-scrollbar-track,
+.main::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.panel-body::-webkit-scrollbar-thumb,
+.main::-webkit-scrollbar-thumb {
+  background: #2e333d;
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+.panel-body::-webkit-scrollbar-thumb:hover,
+.main::-webkit-scrollbar-thumb:hover {
+  background: #4a5160;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+.panel-body::-webkit-scrollbar-corner,
+.main::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Panel body: clean scroll region */
+.panel-body {
+  scroll-behavior: smooth;
+  overscroll-behavior: contain;
+}
