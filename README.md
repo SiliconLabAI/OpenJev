@@ -1,21 +1,30 @@
 # OpenJev
 
-Open approximation of [TypeSafe Jev](https://docs.typesafe.ai) — a **System One** style decision engine.
+Open source System One–style decision engine inspired by [TypeSafe Jev](https://docs.typesafe.ai).
 
-Instead of one flaky “return a giant JSON blob” call, OpenJev uses a **parallel sampler**:
+Give it **state** and typed **questions** — get structured answers (choice, score, or probability), not free-form text.
 
-1. **Fixed answer space** — no free-form text generation
-2. **Each option scored independently** against the same state
-3. **Scores normalized** (logit → softmax) into a probability distribution
+OpenJev uses a **parallel sampler**:
+
+1. **Fixed answer space** — no free-form text generation  
+2. **Each option scored independently** against the same state  
+3. **Scores normalized** (logit → softmax) into a probability distribution  
 4. **All questions run in parallel** (`Promise.all`)
 
-That mirrors how Jev is described: parallel evaluation over a declared answer set, not sequential token generation.
+## Tutorial
+
+Watch the walkthrough:
+
+**https://youtu.be/xtXq279B4Go**
+
+[![OpenJev Tutorial](https://img.youtube.com/vi/xtXq279B4Go/maxresdefault.jpg)](https://youtu.be/xtXq279B4Go)
 
 ## Quick start
 
 ```bash
-cd OpenJev   # folder name; package is "OpenJev"
+cd OpenJev
 npm install
+cp .env.example .env   # add OPENAI_API_KEY (or another provider key)
 npm run dev
 ```
 
@@ -26,7 +35,7 @@ Open **http://localhost:3001**
 | mode     | `parallel` (default) or `oneshot`  |
 | model    | `gpt-4o-mini`, `qwen-3.8-27b`, …   |
 | base url | provider base, or empty for OpenAI |
-| api key  | your key                           |
+| api key  | optional if set in `.env`          |
 
 ```bash
 export OPENAI_API_KEY=sk-...
@@ -114,10 +123,31 @@ STATEMENT = "The correct answer is <key> (<description>)."
 
 Independent `p` values → logits via `logit(p) = log(p/(1-p))` → **softmax** → distribution.
 
-- **choice** → argmax + confidence from top-1 / gap
-- **score** → expected value of the discrete distribution (interpolation allowed)
+- **choice** → argmax + confidence from top-1 / gap  
+- **score** → expected value of the discrete distribution (interpolation allowed)  
 - **noul** → single `p`
 
-## Not real Jev
+## Environment
 
-OpenJev uses ordinary chat LLMs as micro-scorers. Real Jev is a specialized System One model (RLCD, custom parallel sampler, ~70–500 ms). This is an **open architectural approximation** of the contract, not a weight-compatible reimplementation.
+```env
+OPENAI_API_KEY=sk-...
+# CEREBRAS_API_KEY=
+# GROQ_API_KEY=
+# OPENAI_BASE_URL=https://api.openai.com/v1
+# OPENJEV_MODEL=gpt-4o-mini
+```
+
+Keys in `.env` are loaded automatically. The UI key field is optional when `.env` is set.
+
+## Layout
+
+```
+OpenJev/
+├── server/index.ts           # Express + Vite, POST /api/evaluate
+├── server/loadEnv.ts         # .env loader
+├── src/lib/evaluate.ts       # Parallel sampler + oneshot fallback
+├── src/lib/types.ts
+├── src/components/...
+├── src/App.tsx
+└── package.json              # name: "openjev"
+```
