@@ -1,5 +1,3 @@
-/** OpenJev question types (Jev-compatible surface) */
-
 export type QuestionType = "choice" | "score" | "noul" | "boolean";
 
 export interface ChoiceQuestion {
@@ -17,11 +15,13 @@ export interface ScoreQuestion {
 export interface NoulQuestion {
   type: "noul" | "boolean";
   instructions?: string;
-  criteria?: { true?: string; false?: string };
 }
 
 export type Question = ChoiceQuestion | ScoreQuestion | NoulQuestion;
 export type Questions = Record<string, Question>;
+
+/** parallel/oneshot = LLM micro-scorers; decider = Mapika/decider HTTP */
+export type BackendMode = "parallel" | "oneshot" | "decider";
 
 export interface EvaluateRequest {
   state: string | Record<string, unknown> | unknown[];
@@ -30,8 +30,9 @@ export interface EvaluateRequest {
   base_url?: string;
   api_key?: string;
   temperature?: number;
-  /** parallel = score each option independently (default); oneshot = single JSON blob */
-  mode?: "parallel" | "oneshot";
+  mode?: BackendMode;
+  /** Override for Mapika/decider server, e.g. http://localhost:8000 */
+  decider_url?: string;
 }
 
 export interface ChoiceAnswer {
@@ -59,14 +60,12 @@ export type Answer = ChoiceAnswer | ScoreAnswer | NoulAnswer;
 export interface EvaluateResponse {
   model: string;
   answers: Record<string, Answer>;
-  usage: {
-    input_tokens: number | null;
-    output_tokens: number | null;
-  };
+  usage: { input_tokens: number | null; output_tokens: number | null };
   meta?: {
-    mode: "parallel" | "oneshot";
+    mode: BackendMode;
     latency_ms: number;
     parallel_calls: number;
+    backend?: string;
   };
   error?: string;
 }
@@ -90,7 +89,7 @@ export const DEFAULT_EXAMPLES: {
   {
     id: "support-routing",
     name: "Support Routing",
-    description: "Route a billing complaint to the right team",
+    description: "Route a billing complaint",
     state: JSON.stringify(
       {
         subject: "Charged twice again!!",
@@ -135,7 +134,7 @@ export const DEFAULT_EXAMPLES: {
   {
     id: "stripe-integration",
     name: "Stripe Integration",
-    description: "Urgency + department for a failing Stripe connect",
+    description: "Failing Stripe connect",
     state:
       "Hi, I've been trying to connect my Stripe account for 3 days and the integration keeps failing. I'm losing sales. Please help ASAP.",
     questions: [
@@ -176,7 +175,7 @@ export const DEFAULT_EXAMPLES: {
   {
     id: "content-mod",
     name: "Content Moderation",
-    description: "Simple yes/no toxicity check",
+    description: "Toxicity check",
     state:
       "This product is absolute garbage and the CEO should be ashamed. Refund me now or I'll post this everywhere.",
     questions: [
@@ -214,23 +213,12 @@ export function draftsToQuestions(drafts: QuestionDraft[]): Questions {
         if (o.key.trim()) criteria[o.key.trim()] = o.description || o.key;
       }
       if (Object.keys(criteria).length === 0) continue;
-      out[d.name] = {
-        type: "choice",
-        instructions: d.instructions,
-        criteria,
-      };
+      out[d.name] = { type: "choice", instructions: d.instructions, criteria };
     } else if (d.type === "score") {
       if (d.levels.length === 0) continue;
-      out[d.name] = {
-        type: "score",
-        instructions: d.instructions,
-        criteria: d.levels,
-      };
+      out[d.name] = { type: "score", instructions: d.instructions, criteria: d.levels };
     } else {
-      out[d.name] = {
-        type: "noul",
-        instructions: d.instructions,
-      };
+      out[d.name] = { type: "noul", instructions: d.instructions };
     }
   }
   return out;

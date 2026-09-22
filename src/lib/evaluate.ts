@@ -1,18 +1,12 @@
 /**
- * OpenJev — open approximation of TypeSafe Jev's System One contract.
- *
- * Design (inspired by how Jev actually works):
- *
- * 1. Fixed answer space — no free-form text generation.
- * 2. Parallel sampler — each candidate (choice key, score level, or noul)
- *    is scored independently against the same state, then normalized.
- * 3. Questions are also evaluated in parallel (Promise.all).
- *
- * This avoids the flaky single-shot "return a big JSON blob" failure mode.
+ * OpenJev evaluate backends:
+ * - parallel / oneshot: OpenAI-compatible chat LLMs
+ * - decider: Mapika/decider HTTP (POST /v1/systemone) — real System One weights
  */
 import OpenAI from "openai";
 import type {
   Answer,
+  BackendMode,
   ChoiceAnswer,
   EvaluateRequest,
   EvaluateResponse,
@@ -33,12 +27,16 @@ function makeClient(apiKey?: string, baseUrl?: string) {
     process.env.API_KEY;
   if (!key) {
     throw new Error(
-      "No API key provided. Set OPENAI_API_KEY in .env or pass api_key in the request."
+      "No API key. Set OPENAI_API_KEY in .env or pass api_key in the request."
     );
   }
   return new OpenAI({
     apiKey: key,
-    baseURL: (baseUrl && baseUrl.trim()) || process.env.OPENAI_BASE_URL || process.env.OPENJEV_BASE_URL || undefined,
+    baseURL:
+      (baseUrl && baseUrl.trim()) ||
+      process.env.OPENAI_BASE_URL ||
+      process.env.OPENJEV_BASE_URL ||
+      undefined,
   });
 }
 
@@ -48,10 +46,6 @@ interface ScoreCallResult {
   tokens_out: number;
 }
 
-/**
- * Ask the model: "Given STATE, how likely is STATEMENT true?"
- * Tiny constrained output — only a probability, no free text.
- */
 async function scoreProposition(
   client: OpenAI,
   model: string,
@@ -64,7 +58,6 @@ async function scoreProposition(
     "Given a STATE and a STATEMENT, return only how likely the statement is true " +
     "based solely on the state. Do not invent facts. " +
     'Respond with JSON: {"p": <number 0 to 1>}.';
-
   const user = `STATE:\n${state}\n\nSTATEMENT:\n${statement}\n\nHow likely is the statement true (0–1)?`;
 
   let completion: OpenAI.Chat.Completions.ChatCompletion;
@@ -84,9 +77,7 @@ async function scoreProposition(
           strict: true,
           schema: {
             type: "object",
-            properties: {
-              p: { type: "number", minimum: 0, maximum: 1 },
-            },
+            properties: { p: { type: "number", minimum: 0, maximum: 1 } },
             required: ["p"],
             additionalProperties: false,
           },
@@ -134,7 +125,6 @@ function softmax(logits: number[], temperature = 1): number[] {
   return exps.map((e) => e / sum);
 }
 
-/** Independent relevance scores [0,1] → probability distribution via logit + softmax */
 function scoresToDistribution(scores: number[]): number[] {
   const logits = scores.map((p) => {
     const clamped = Math.min(0.999, Math.max(0.001, p));
@@ -150,10 +140,9 @@ async function evaluateChoiceParallel(
   name: string,
   q: Extract<Question, { type: "choice" }>,
   temperature: number
-): Promise<{ answer: ChoiceAnswer; tokens_in: number; tokens_out: number; calls: number }> {
+) {
   const keys = Object.keys(q.criteria);
   const instructions = q.instructions ?? `Select the best label for "${name}"`;
-
   const results = await Promise.all(
     keys.map((key) => {
       const desc = q.criteria[key];
@@ -164,28 +153,26 @@ async function evaluateChoiceParallel(
       return scoreProposition(client, model, state, statement, temperature);
     })
   );
-
-  const rawScores = results.map((r) => r.probability);
-  const probs = scoresToDistribution(rawScores);
+  const probs = scoresToDistribution(results.map((r) => r.probability));
   const probabilities: Record<string, number> = {};
   keys.forEach((k, i) => {
     probabilities[k] = Math.round(probs[i] * 1000) / 1000;
   });
-
   let bestIdx = 0;
-  for (let i = 1; i < probs.length; i++) {
-    if (probs[i] > probs[bestIdx]) bestIdx = i;
-  }
-  const choice = keys[bestIdx];
+  for (let i = 1; i < probs.length; i++) if (probs[i] > probs[bestIdx]) bestIdx = i;
   const sorted = [...probs].sort((a, b) => b - a);
   const gap = (sorted[0] ?? 0) - (sorted[1] ?? 0);
   const confidence = Math.min(
     1,
     Math.max(0, Math.round((0.5 * (sorted[0] ?? 0) + 0.5 * (gap + 0.5)) * 1000) / 1000)
   );
-
   return {
-    answer: { type: "choice", choice, confidence, probabilities },
+    answer: {
+      type: "choice" as const,
+      choice: keys[bestIdx],
+      confidence,
+      probabilities,
+    },
     tokens_in: results.reduce((s, r) => s + r.tokens_in, 0),
     tokens_out: results.reduce((s, r) => s + r.tokens_out, 0),
     calls: keys.length,
@@ -199,46 +186,38 @@ async function evaluateScoreParallel(
   name: string,
   q: Extract<Question, { type: "score" }>,
   temperature: number
-): Promise<{ answer: ScoreAnswer; tokens_in: number; tokens_out: number; calls: number }> {
+) {
   const levels = q.criteria;
   const instructions = q.instructions ?? `Rate "${name}"`;
-
   const results = await Promise.all(
     levels.map((label, i) => {
       const statement = `On the scale for "${instructions}", the most appropriate rating is level ${i}: "${label}".`;
       return scoreProposition(client, model, state, statement, temperature);
     })
   );
-
-  const rawScores = results.map((r) => r.probability);
-  const probs = scoresToDistribution(rawScores);
-
+  const probs = scoresToDistribution(results.map((r) => r.probability));
   let score = 0;
   probs.forEach((p, i) => {
     score += p * i;
   });
   score = Math.round(score * 100) / 100;
-
   const legend: Record<string, string> = {};
   levels.forEach((l, i) => {
     legend[String(i)] = l;
   });
-
   const probabilityMap: Record<string, number> = {};
   probs.forEach((p, i) => {
     probabilityMap[String(i)] = Math.round(p * 1000) / 1000;
   });
-
   const sorted = [...probs].sort((a, b) => b - a);
   const gap = (sorted[0] ?? 0) - (sorted[1] ?? 0);
   const confidence = Math.min(
     1,
     Math.max(0, Math.round((0.5 * (sorted[0] ?? 0) + 0.5 * (gap + 0.5)) * 1000) / 1000)
   );
-
   return {
     answer: {
-      type: "score",
+      type: "score" as const,
       score,
       confidence,
       legend,
@@ -257,14 +236,12 @@ async function evaluateNoulParallel(
   name: string,
   q: Extract<Question, { type: "noul" | "boolean" }>,
   temperature: number
-): Promise<{ answer: NoulAnswer; tokens_in: number; tokens_out: number; calls: number }> {
+) {
   let statement = q.instructions?.trim() || `The proposition "${name}" is true.`;
   if (!statement.endsWith("?") && !statement.endsWith(".")) statement += ".";
-
   const result = await scoreProposition(client, model, state, statement, temperature);
-
   return {
-    answer: { type: "noul", noul: Math.round(result.probability * 1000) / 1000 },
+    answer: { type: "noul" as const, noul: Math.round(result.probability * 1000) / 1000 },
     tokens_in: result.tokens_in,
     tokens_out: result.tokens_out,
     calls: 1,
@@ -277,12 +254,7 @@ async function evaluateOneshot(
   state: string,
   questions: Questions,
   temperature: number
-): Promise<{
-  answers: Record<string, Answer>;
-  tokens_in: number;
-  tokens_out: number;
-  calls: number;
-}> {
+) {
   const questionDescriptions: string[] = [];
   for (const [name, q] of Object.entries(questions)) {
     let desc = `- ${name} (${q.type}): ${q.instructions ?? ""}`;
@@ -295,18 +267,13 @@ async function evaluateOneshot(
     }
     questionDescriptions.push(desc);
   }
-
   const system =
     "You are a precise decision engine. Answer every question based only on the provided state. " +
     "Return probabilities that reflect genuine uncertainty. Do not invent information.";
-
   const user =
     `STATE:\n${state}\n\nQUESTIONS:\n${questionDescriptions.join("\n")}\n\n` +
-    `Respond with JSON matching this shape:\n` +
-    `For each choice question: { "choice": "<key>", "confidence": 0-1, "probabilities": { "<key>": 0-1, ... } }\n` +
-    `For each score question: { "score": <float>, "confidence": 0-1 }\n` +
-    `For each noul question: { "noul": 0-1 }\n` +
-    `Top-level keys must be the question names.`;
+    `Respond with JSON. For choice: { "choice", "confidence", "probabilities" }. ` +
+    `For score: { "score", "confidence" }. For noul: { "noul" }. Top-level keys = question names.`;
 
   const completion = await client.chat.completions.create({
     model,
@@ -366,6 +333,117 @@ async function evaluateOneshot(
   };
 }
 
+/**
+ * Call Mapika/decider HTTP server (TypeSafe wire format).
+ * https://github.com/Mapika/decider — scripts/serve.sh Mapika/decider-2b 8000
+ */
+async function evaluateDecider(
+  state: string | Record<string, unknown> | unknown[],
+  questions: Questions,
+  deciderUrl: string,
+  apiKey?: string
+): Promise<{
+  answers: Record<string, Answer>;
+  model: string;
+  tokens_in: number | null;
+  tokens_out: number | null;
+}> {
+  const base = deciderUrl.replace(/\/$/, "");
+  const url = `${base}/v1/systemone`;
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  const key =
+    (apiKey && apiKey.trim()) ||
+    process.env.DECIDER_API_KEY ||
+    process.env.TYPESAFE_API_KEY ||
+    "local";
+  headers.Authorization = `Bearer ${key}`;
+
+  const body = {
+    state,
+    questions,
+    model: "decider",
+  };
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(
+      `decider ${res.status} from ${url}: ${text.slice(0, 400)}. ` +
+        `Is the server running? scripts/serve.sh Mapika/decider-2b 8000`
+    );
+  }
+
+  let data: {
+    model?: string;
+    answers?: Record<string, Record<string, unknown>>;
+    usage?: { input_tokens?: number; output_tokens?: number };
+  };
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`decider returned non-JSON: ${text.slice(0, 200)}`);
+  }
+
+  const answers: Record<string, Answer> = {};
+  const rawAnswers = data.answers ?? {};
+
+  for (const [name, q] of Object.entries(questions)) {
+    const a = rawAnswers[name] ?? {};
+    if (q.type === "choice") {
+      const probs = (a.probabilities as Record<string, number>) ?? {};
+      const choice = String(a.choice ?? Object.keys(q.criteria)[0] ?? "");
+      answers[name] = {
+        type: "choice",
+        choice,
+        confidence: Number(a.confidence ?? a.certainty ?? probs[choice] ?? 0.5),
+        probabilities: Object.keys(q.criteria).reduce(
+          (acc, k) => {
+            acc[k] = Number(probs[k] ?? 0);
+            return acc;
+          },
+          {} as Record<string, number>
+        ),
+      };
+    } else if (q.type === "score") {
+      const legend: Record<string, string> = {};
+      q.criteria.forEach((l, i) => {
+        legend[String(i)] = l;
+      });
+      const probs =
+        (a.probabilities as Record<string, number>) ??
+        (a.level_fit as Record<string, number>) ??
+        {};
+      answers[name] = {
+        type: "score",
+        score: Number(a.score ?? 0),
+        confidence: Number(a.confidence ?? a.fit_mass ?? 0.5),
+        legend,
+        probabilities: probs,
+      };
+    } else {
+      answers[name] = {
+        type: "noul",
+        noul: Number(a.noul ?? a.probability ?? 0.5),
+      };
+    }
+  }
+
+  return {
+    answers,
+    model: data.model ?? "Mapika/decider-2b",
+    tokens_in: data.usage?.input_tokens ?? null,
+    tokens_out: data.usage?.output_tokens ?? null,
+  };
+}
+
 export async function evaluate(req: EvaluateRequest): Promise<EvaluateResponse> {
   const t0 = Date.now();
   const {
@@ -376,37 +454,81 @@ export async function evaluate(req: EvaluateRequest): Promise<EvaluateResponse> 
     api_key,
     temperature = 0,
     mode = "parallel",
+    decider_url,
   } = req;
 
   if (!questions || Object.keys(questions).length === 0) {
     throw new Error("At least one question is required");
   }
 
+  // ── decider backend (Mapika/decider) ─────────────────────────────────
+  if (mode === "decider") {
+    const url =
+      (decider_url && decider_url.trim()) ||
+      process.env.DECIDER_BASE_URL ||
+      "http://localhost:8000";
+
+    const result = await evaluateDecider(state, questions, url, api_key);
+
+    return {
+      model: result.model,
+      answers: result.answers,
+      usage: {
+        input_tokens: result.tokens_in,
+        output_tokens: result.tokens_out,
+      },
+      meta: {
+        mode: "decider",
+        latency_ms: Date.now() - t0,
+        parallel_calls: 1,
+        backend: url,
+      },
+    };
+  }
+
   const stateStr =
     typeof state === "string" ? state : JSON.stringify(state, null, 2);
-
   const client = makeClient(api_key, base_url);
 
   if (mode === "parallel") {
-    const entries = Object.entries(questions);
-
     const settled = await Promise.all(
-      entries.map(async ([name, q]) => {
+      Object.entries(questions).map(async ([name, q]) => {
         if (q.type === "choice") {
           return {
             name,
-            ...(await evaluateChoiceParallel(client, model, stateStr, name, q, temperature)),
+            ...(await evaluateChoiceParallel(
+              client,
+              model,
+              stateStr,
+              name,
+              q,
+              temperature
+            )),
           };
         }
         if (q.type === "score") {
           return {
             name,
-            ...(await evaluateScoreParallel(client, model, stateStr, name, q, temperature)),
+            ...(await evaluateScoreParallel(
+              client,
+              model,
+              stateStr,
+              name,
+              q,
+              temperature
+            )),
           };
         }
         return {
           name,
-          ...(await evaluateNoulParallel(client, model, stateStr, name, q, temperature)),
+          ...(await evaluateNoulParallel(
+            client,
+            model,
+            stateStr,
+            name,
+            q,
+            temperature
+          )),
         };
       })
     );
@@ -415,7 +537,6 @@ export async function evaluate(req: EvaluateRequest): Promise<EvaluateResponse> 
     let tokens_in = 0;
     let tokens_out = 0;
     let parallel_calls = 0;
-
     for (const s of settled) {
       answers[s.name] = s.answer;
       tokens_in += s.tokens_in;
@@ -434,11 +555,18 @@ export async function evaluate(req: EvaluateRequest): Promise<EvaluateResponse> 
         mode: "parallel",
         latency_ms: Date.now() - t0,
         parallel_calls,
+        backend: "openai-compatible",
       },
     };
   }
 
-  const oneshot = await evaluateOneshot(client, model, stateStr, questions, temperature);
+  const oneshot = await evaluateOneshot(
+    client,
+    model,
+    stateStr,
+    questions,
+    temperature
+  );
 
   return {
     model,
@@ -451,6 +579,7 @@ export async function evaluate(req: EvaluateRequest): Promise<EvaluateResponse> 
       mode: "oneshot",
       latency_ms: Date.now() - t0,
       parallel_calls: oneshot.calls,
+      backend: "openai-compatible",
     },
   };
 }

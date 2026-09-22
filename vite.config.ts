@@ -6,18 +6,7 @@ export default defineConfig({
   plugins: [react()],
   root: ".",
   publicDir: "public",
-  resolve: {
-    alias: {
-      "@": path.resolve(__dirname, "src"),
-    },
-  },
-  build: {
-    outDir: "dist",
-    emptyOutDir: true,
-  },
-  server: {
-    proxy: {
-      "/api": "http://localhost:3001",
-    },
-  },
+  resolve: { alias: { "@": path.resolve(__dirname, "src") } },
+  build: { outDir: "dist", emptyOutDir: true },
+  server: { proxy: { "/api": "http://localhost:3001" } },
 });

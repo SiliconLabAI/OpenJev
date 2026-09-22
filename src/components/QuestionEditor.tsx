@@ -7,18 +7,13 @@ interface Props {
 }
 
 export function QuestionEditor({ question, onChange, onRemove }: Props) {
-  const update = (patch: Partial<QuestionDraft>) =>
-    onChange({ ...question, ...patch });
-
-  const typeLabel =
-    question.type === "boolean" ? "noul" : question.type;
+  const update = (patch: Partial<QuestionDraft>) => onChange({ ...question, ...patch });
+  const typeLabel = question.type === "boolean" ? "noul" : question.type;
 
   return (
     <div className="question-card">
       <div className="question-card-header">
-        <span className={`question-type-badge ${typeLabel}`}>
-          {typeLabel}
-        </span>
+        <span className={`question-type-badge ${typeLabel}`}>{typeLabel}</span>
         <input
           className="question-name-input"
           value={question.name}
@@ -26,17 +21,10 @@ export function QuestionEditor({ question, onChange, onRemove }: Props) {
           placeholder="question_name"
           spellCheck={false}
         />
-        <button
-          type="button"
-          className="question-remove"
-          onClick={onRemove}
-          title="Remove question"
-          aria-label="Remove question"
-        >
+        <button type="button" className="question-remove" onClick={onRemove} aria-label="Remove">
           ✕
         </button>
       </div>
-
       <div className="question-card-body">
         <input
           className="question-instructions"
@@ -44,7 +32,6 @@ export function QuestionEditor({ question, onChange, onRemove }: Props) {
           onChange={(e) => update({ instructions: e.target.value })}
           placeholder="Instructions for the model…"
         />
-
         {question.type === "choice" && (
           <div className="options-list">
             {question.options.map((opt, i) => (
@@ -71,12 +58,7 @@ export function QuestionEditor({ question, onChange, onRemove }: Props) {
                 <button
                   type="button"
                   className="option-remove"
-                  onClick={() => {
-                    update({
-                      options: question.options.filter((_, j) => j !== i),
-                    });
-                  }}
-                  aria-label="Remove option"
+                  onClick={() => update({ options: question.options.filter((_, j) => j !== i) })}
                 >
                   ✕
                 </button>
@@ -85,29 +67,17 @@ export function QuestionEditor({ question, onChange, onRemove }: Props) {
             <button
               type="button"
               className="add-option-btn"
-              onClick={() =>
-                update({
-                  options: [
-                    ...question.options,
-                    { key: "", description: "" },
-                  ],
-                })
-              }
+              onClick={() => update({ options: [...question.options, { key: "", description: "" }] })}
             >
               + Add option
             </button>
           </div>
         )}
-
         {question.type === "score" && (
           <div className="options-list">
             {question.levels.map((lvl, i) => (
               <div className="option-row" key={i}>
-                <input
-                  value={String(i)}
-                  disabled
-                  style={{ opacity: 0.5, width: 40 }}
-                />
+                <input value={String(i)} disabled style={{ opacity: 0.5, width: 40 }} />
                 <input
                   value={lvl}
                   onChange={(e) => {
@@ -120,12 +90,7 @@ export function QuestionEditor({ question, onChange, onRemove }: Props) {
                 <button
                   type="button"
                   className="option-remove"
-                  onClick={() => {
-                    update({
-                      levels: question.levels.filter((_, j) => j !== i),
-                    });
-                  }}
-                  aria-label="Remove level"
+                  onClick={() => update({ levels: question.levels.filter((_, j) => j !== i) })}
                 >
                   ✕
                 </button>
@@ -134,9 +99,7 @@ export function QuestionEditor({ question, onChange, onRemove }: Props) {
             <button
               type="button"
               className="add-option-btn"
-              onClick={() =>
-                update({ levels: [...question.levels, ""] })
-              }
+              onClick={() => update({ levels: [...question.levels, ""] })}
             >
               + Add level
             </button>
@@ -172,12 +135,5 @@ export function newQuestion(type: QuestionType): QuestionDraft {
       levels: ["Low", "Medium", "High"],
     };
   }
-  return {
-    id,
-    name: "noul_q",
-    type: "noul",
-    instructions: "",
-    options: [],
-    levels: [],
-  };
+  return { id, name: "noul_q", type: "noul", instructions: "", options: [], levels: [] };
 }

@@ -1,8 +1,3 @@
-/**
- * Minimal .env loader (no dependency).
- * Loads .env and .env.local from the project root into process.env
- * without overwriting variables that are already set.
- */
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -19,16 +14,13 @@ function parseEnvFile(filePath: string): void {
     if (eq <= 0) continue;
     const key = trimmed.slice(0, eq).trim();
     let val = trimmed.slice(eq + 1).trim();
-    // strip surrounding quotes
     if (
       (val.startsWith('"') && val.endsWith('"')) ||
       (val.startsWith("'") && val.endsWith("'"))
     ) {
       val = val.slice(1, -1);
     }
-    if (key && process.env[key] === undefined) {
-      process.env[key] = val;
-    }
+    if (key && process.env[key] === undefined) process.env[key] = val;
   }
 }
 

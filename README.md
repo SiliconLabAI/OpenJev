@@ -1,153 +1,150 @@
 # OpenJev
 
-Open source System One–style decision engine inspired by [TypeSafe Jev](https://docs.typesafe.ai).
+Open source System One–style decision playground: **state + typed questions → structured answers**.
 
-Give it **state** and typed **questions** — get structured answers (choice, score, or probability), not free-form text.
+Three backends:
 
-OpenJev uses a **parallel sampler**:
-
-1. **Fixed answer space** — no free-form text generation  
-2. **Each option scored independently** against the same state  
-3. **Scores normalized** (logit → softmax) into a probability distribution  
-4. **All questions run in parallel** (`Promise.all`)
+| Mode | What it is |
+|------|------------|
+| **parallel** | LLM micro-scorers (one tiny `{p}` call per option, then softmax) |
+| **oneshot** | Single structured JSON call to any OpenAI-compatible model |
+| **decider** | [Mapika/decider](https://github.com/Mapika/decider) — real System One weights (calibration-aware RL on v10) |
 
 ## Tutorial
 
-Watch the walkthrough:
-
-**https://youtu.be/xtXq279B4Go**
+https://youtu.be/xtXq279B4Go
 
 [![OpenJev Tutorial](https://img.youtube.com/vi/xtXq279B4Go/maxresdefault.jpg)](https://youtu.be/xtXq279B4Go)
 
-## Quick start
+## Quick start (LLM backends)
 
 ```bash
 cd OpenJev
 npm install
-cp .env.example .env   # add OPENAI_API_KEY (or another provider key)
+cp .env.example .env   # set OPENAI_API_KEY
 npm run dev
 ```
 
-Open **http://localhost:3001**
+Open http://localhost:3001 — mode **parallel** or **oneshot**.
 
-| Field    | Example                            |
-|----------|------------------------------------|
-| mode     | `parallel` (default) or `oneshot`  |
-| model    | `gpt-4o-mini`, `qwen-3.8-27b`, …   |
-| base url | provider base, or empty for OpenAI |
-| api key  | optional if set in `.env`          |
+## Integrate Mapika/decider (RLCD / System One)
+
+[decider](https://github.com/Mapika/decider) is an open System One model family (Qwen3.5 fine-tunes).  
+`decider-2b` **v10** includes calibration-aware RL. It speaks TypeSafe’s wire format: `POST /v1/systemone`.
+
+### 1. Serve the model (needs a CUDA GPU, ~4 GB for 2B)
 
 ```bash
-export OPENAI_API_KEY=sk-...
-npm run dev
+pip install "git+https://github.com/Mapika/decider#egg=decider[serve]"
+# or: git clone https://github.com/Mapika/decider && cd decider && pip install -e ".[serve]"
+
+scripts/serve.sh Mapika/decider-2b 8000
 ```
 
-## Why parallel mode is more reliable
+Smoke test:
 
-| Mode | Behavior | Failure mode |
-|------|----------|--------------|
-| **parallel** (default) | One tiny `{"p": 0–1}` call **per option**, then softmax | Rare — each call is tiny and constrained |
-| **oneshot** | One big structured JSON for all questions | Model drops keys, invents labels, invalid JSON |
-
-Example: choice with 4 options → 4 parallel micro-calls. Score with 4 levels → same. Noul → 1 call. Questions themselves also run in parallel.
-
-## API
-
-```http
-POST /api/evaluate
-Content-Type: application/json
-```
-
-```json
-{
-  "state": "Charged twice again!! Second month in a row.",
-  "mode": "parallel",
+```bash
+curl -s localhost:8000/v1/systemone -H 'content-type: application/json' -d '{
+  "state": "My card was charged twice.",
   "questions": {
-    "department": {
+    "team": {
       "type": "choice",
-      "instructions": "Which team should handle this?",
-      "criteria": {
-        "billing": "Charges, refunds, invoices",
-        "technical": "Bugs or product issues",
-        "other": "Doesn't fit"
-      }
+      "instructions": "Which team?",
+      "criteria": { "billing": "charges, refunds", "technical": "bugs, outages" }
     },
-    "urgency": {
-      "type": "score",
-      "instructions": "How urgent?",
-      "criteria": ["Low", "Medium", "High", "Critical"]
-    },
-    "angry": {
-      "type": "noul",
-      "instructions": "Strong frustration or anger?"
+    "refund": { "type": "noul", "instructions": "Is a refund needed?" }
+  }
+}'
+```
+
+### 2. Point OpenJev at it
+
+In the UI: set **mode = decider**, **decider url = http://localhost:8000**
+
+Or via API:
+
+```bash
+curl -X POST http://localhost:3001/api/evaluate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "mode": "decider",
+    "decider_url": "http://localhost:8000",
+    "state": "Charged twice again!!",
+    "questions": {
+      "department": {
+        "type": "choice",
+        "instructions": "Which team?",
+        "criteria": {
+          "billing": "Charges, refunds",
+          "technical": "Bugs",
+          "other": "Else"
+        }
+      },
+      "angry": { "type": "noul", "instructions": "Strong frustration?" }
     }
-  },
-  "model": "gpt-4o-mini"
-}
+  }'
 ```
 
-Response includes full distributions + meta:
+Or in `.env`:
 
-```json
-{
-  "model": "gpt-4o-mini",
-  "answers": {
-    "department": {
-      "type": "choice",
-      "choice": "billing",
-      "confidence": 0.82,
-      "probabilities": { "billing": 0.71, "technical": 0.12, "other": 0.17 }
+```env
+DECIDER_BASE_URL=http://localhost:8000
+```
+
+### 3. Python (no OpenJev) — direct
+
+```python
+from decider.infer import Decider
+d = Decider("Mapika/decider-2b")  # ~4 GB VRAM
+print(d.system_one(
+    "I was charged twice for order A-104.",
+    {
+        "department": {
+            "type": "choice",
+            "instructions": "Which team?",
+            "criteria": {
+                "billing": "Charges, refunds",
+                "technical": "Bugs",
+            },
+        },
+        "refund": {"type": "noul", "instructions": "Is a refund needed?"},
     },
-    "urgency": {
-      "type": "score",
-      "score": 2.4,
-      "confidence": 0.75,
-      "legend": { "0": "Low", "1": "Medium", "2": "High", "3": "Critical" },
-      "probabilities": { "0": 0.05, "1": 0.15, "2": 0.45, "3": 0.35 }
-    },
-    "angry": { "type": "noul", "noul": 0.88 }
-  },
-  "usage": { "input_tokens": 1840, "output_tokens": 96 },
-  "meta": { "mode": "parallel", "latency_ms": 620, "parallel_calls": 9 }
-}
+))
 ```
 
-## How scoring works
-
-For each candidate (choice key or score level):
+### How OpenJev wires it
 
 ```
-STATEMENT = "The correct answer is <key> (<description>)."
-→ model returns { "p": 0.0 … 1.0 }
+UI / curl  →  POST /api/evaluate { mode: "decider", ... }
+                →  OpenJev server
+                →  POST {decider_url}/v1/systemone   (TypeSafe shape)
+                →  Mapika/decider GPU server
+                →  typed answers + probabilities
 ```
 
-Independent `p` values → logits via `logit(p) = log(p/(1-p))` → **softmax** → distribution.
-
-- **choice** → argmax + confidence from top-1 / gap  
-- **score** → expected value of the discrete distribution (interpolation allowed)  
-- **noul** → single `p`
+Same question types as TypeSafe Jev: **choice**, **score**, **noul**.
 
 ## Environment
 
 ```env
-OPENAI_API_KEY=sk-...
-# CEREBRAS_API_KEY=
-# GROQ_API_KEY=
-# OPENAI_BASE_URL=https://api.openai.com/v1
+# LLM backends
+OPENAI_API_KEY=
+# OPENAI_BASE_URL=
 # OPENJEV_MODEL=gpt-4o-mini
-```
 
-Keys in `.env` are loaded automatically. The UI key field is optional when `.env` is set.
+# decider backend
+DECIDER_BASE_URL=http://localhost:8000
+# DECIDER_API_KEY=local
+```
 
 ## Layout
 
 ```
 OpenJev/
-├── server/index.ts           # Express + Vite, POST /api/evaluate
-├── server/loadEnv.ts         # .env loader
-├── src/lib/evaluate.ts       # Parallel sampler + oneshot fallback
+├── server/index.ts        # Express + Vite, POST /api/evaluate
+├── server/loadEnv.ts
+├── src/lib/evaluate.ts    # parallel | oneshot | decider
 ├── src/lib/types.ts
-├── src/components/...
 ├── src/App.tsx
-└── package.json              # name: "openjev"
+└── package.json
 ```
