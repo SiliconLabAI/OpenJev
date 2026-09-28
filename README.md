@@ -124,6 +124,36 @@ UI / curl  →  POST /api/evaluate { mode: "decider", ... }
 
 Same question types as TypeSafe Jev: **choice**, **score**, **noul**.
 
+## Golden-set eval harness (Brier/ECE regression gate)
+
+A labeled dataset (`eval/golden/dataset.jsonl`) runs through `evaluate()` and
+scores **accuracy**, **Brier** and **ECE**. A committed baseline turns this
+into a CI gate: any change that regresses accuracy, calibration, or both fails
+the build.
+
+```bash
+# 1. Label rows in eval/golden/dataset.jsonl
+#    expectations: {"choice":"key"} | {"score":<level idx>} | {"noul":<0..1>}
+
+# 2. Create the baseline once (against your real provider), then commit it
+npm run eval:golden -- --create --model gpt-4o-mini
+
+# 3. Every later change is gated:
+npm run eval:golden            # exits 1 on regression
+```
+
+Thresholds (accuracy −2pt, Brier +0.02, ECE +0.02) live in
+`REGRESSION_THRESHOLDS` in `src/lib/golden.ts`. The CI `eval-regression` job
+runs the check automatically when `OPENAI_API_KEY` is set. To demo the failure
+path without a real provider:
+
+```bash
+MOCK_ANSWER=flat npx tsx eval/golden/mock-server.ts &   # well-calibrated mock
+npx tsx scripts/eval-golden.ts eval/golden/dataset.jsonl --create \
+  --base-url http://127.0.0.1:8901/v1 --model mock --api-key mock
+# ...then compare with a sharp (overconfident) mock and watch the gate fail
+```
+
 ## Environment
 
 ```env

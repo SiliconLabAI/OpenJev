@@ -2,8 +2,34 @@
  * OpenJev evaluate backends:
  * - parallel / oneshot: OpenAI-compatible chat LLMs
  * - decider: Mapika/decider HTTP (POST /v1/systemone) — real System One weights
+ *
+ * Parallel mode defaults to a single-call logprob readout (one completion per
+ * question, option scores from top-logprobs). Questions whose primary readout
+ * fails degrade individually to per-option micro-scorers, so one unsupported
+ * option no longer fails the whole request; a request where every question
+ * fails still errors out. Set OPENJEV_PARALLEL_MODE=micro (or readout:
+ * "micro" per request) to prefer the legacy micro-scorers. Outbound calls are
+ * bounded by OPENJEV_CONCURRENCY (default 6 in flight).
+ *
+ * Distributions are temperature-scaled with a calibration temperature
+ * (OPENJEV_CALIBRATION_T or calibration_temperature per request; default 1 =
+ * no rescaling). Fit T on held-out data with `npm run calibrate`.
  */
 import OpenAI from "openai";
+import {
+  buildOptionLetterPrompt,
+  parseLetterLogprobs,
+  parseYesNoLogprobs,
+  DEFAULT_LOGPROB_TOP_K,
+  type LetterPrompt,
+} from "./logprob";
+import {
+  resolveCalibrationT,
+  softmaxFromLogits,
+  temperatureScaleProbs,
+} from "./calibration";
+import { withRetry } from "./retry";
+import { limitConcurrency } from "./concurrency";
 import type {
   Answer,
   BackendMode,
@@ -30,6 +56,10 @@ function makeClient(apiKey?: string, baseUrl?: string) {
       "No API key. Set OPENAI_API_KEY in .env or pass api_key in the request."
     );
   }
+  const timeoutRaw = Number(process.env.OPENJEV_TIMEOUT_MS);
+  const timeout = Number.isFinite(timeoutRaw) && timeoutRaw > 0 ? timeoutRaw : 30_000;
+  // Retries are owned by our own withRetry helper (exponential backoff +
+  // Retry-After), so disable the SDK's internal retry loop.
   return new OpenAI({
     apiKey: key,
     baseURL:
@@ -37,13 +67,60 @@ function makeClient(apiKey?: string, baseUrl?: string) {
       process.env.OPENAI_BASE_URL ||
       process.env.OPENJEV_BASE_URL ||
       undefined,
+    timeout,
+    maxRetries: 0,
   });
+}
+
+function perRequestConcurrency(): number {
+  const raw = Number(process.env.OPENJEV_CONCURRENCY);
+  return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 6;
+}
+
+/** Uniform-probability placeholder used when every readout failed for one question. */
+function neutralChoiceAnswer(keys: string[]): ChoiceAnswer {
+  const probabilities: Record<string, number> = {};
+  const p = r3(1 / keys.length);
+  keys.forEach((k) => {
+    probabilities[k] = p;
+  });
+  return { type: "choice", choice: keys[0], confidence: p, probabilities };
+}
+
+function neutralScoreAnswer(levels: string[]): ScoreAnswer {
+  const legend: Record<string, string> = {};
+  levels.forEach((l, i) => {
+    legend[String(i)] = l;
+  });
+  const p = r3(1 / levels.length);
+  const probabilities: Record<string, number> = {};
+  levels.forEach((_l, i) => {
+    probabilities[String(i)] = p;
+  });
+  return {
+    type: "score",
+    score: Math.round(((levels.length - 1) / 2) * 100) / 100,
+    confidence: p,
+    legend,
+    probabilities,
+  };
 }
 
 interface ScoreCallResult {
   probability: number;
   tokens_in: number;
   tokens_out: number;
+  retries: number;
+}
+
+function r3(x: number): number {
+  return Math.round(x * 1000) / 1000;
+}
+
+function confidenceFromProbs(probs: number[]): number {
+  const sorted = [...probs].sort((a, b) => b - a);
+  const gap = (sorted[0] ?? 0) - (sorted[1] ?? 0);
+  return Math.min(1, Math.max(0, r3(0.5 * (sorted[0] ?? 0) + 0.5 * (gap + 0.5))));
 }
 
 async function scoreProposition(
@@ -51,7 +128,8 @@ async function scoreProposition(
   model: string,
   state: string,
   statement: string,
-  temperature: number
+  temperature: number,
+  signal?: AbortSignal
 ): Promise<ScoreCallResult> {
   const system =
     "You are a calibrated probability estimator. " +
@@ -60,9 +138,12 @@ async function scoreProposition(
     'Respond with JSON: {"p": <number 0 to 1>}.';
   const user = `STATE:\n${state}\n\nSTATEMENT:\n${statement}\n\nHow likely is the statement true (0–1)?`;
 
-  let completion: OpenAI.Chat.Completions.ChatCompletion;
-  try {
-    completion = await client.chat.completions.create({
+  const create = (
+    responseFormat:
+      | OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming["response_format"]
+      | undefined
+  ) =>
+    client.chat.completions.create({
       model,
       messages: [
         { role: "system", content: system },
@@ -70,7 +151,13 @@ async function scoreProposition(
       ],
       temperature,
       max_tokens: 32,
-      response_format: {
+      response_format: responseFormat,
+    } as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming, { signal });
+
+  // json_schema first (strict providers), json_object as a fallback shape.
+  const { result: completion, retries } = await withRetry("micro-score", async () => {
+    try {
+      return await create({
         type: "json_schema",
         json_schema: {
           name: "prob",
@@ -82,20 +169,11 @@ async function scoreProposition(
             additionalProperties: false,
           },
         },
-      },
-    });
-  } catch {
-    completion = await client.chat.completions.create({
-      model,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: user },
-      ],
-      temperature,
-      max_tokens: 32,
-      response_format: { type: "json_object" },
-    });
-  }
+      });
+    } catch {
+      return await create({ type: "json_object" });
+    }
+  });
 
   const raw = completion.choices[0]?.message?.content ?? "{}";
   let p = 0.5;
@@ -113,25 +191,227 @@ async function scoreProposition(
     probability: p,
     tokens_in: completion.usage?.prompt_tokens ?? 0,
     tokens_out: completion.usage?.completion_tokens ?? 0,
+    retries,
   };
 }
 
-function softmax(logits: number[], temperature = 1): number[] {
-  const t = Math.max(0.05, temperature);
-  const scaled = logits.map((x) => x / t);
-  const max = Math.max(...scaled);
-  const exps = scaled.map((x) => Math.exp(x - max));
-  const sum = exps.reduce((a, b) => a + b, 0) || 1;
-  return exps.map((e) => e / sum);
-}
-
-function scoresToDistribution(scores: number[]): number[] {
+function scoresToDistribution(scores: number[], calibrationT = 1): number[] {
   const logits = scores.map((p) => {
     const clamped = Math.min(0.999, Math.max(0.001, p));
     return Math.log(clamped / (1 - clamped));
   });
-  return softmax(logits, 1);
+  return softmaxFromLogits(logits, calibrationT);
 }
+
+// ── logprob readout (one call per question) ────────────────────────────────
+
+interface LetterReadResult {
+  logits: number[];
+  matched: number;
+  tokens_in: number;
+  tokens_out: number;
+  retries: number;
+}
+
+async function readLetterLogprobs(
+  client: OpenAI,
+  model: string,
+  prompt: LetterPrompt,
+  optionCount: number,
+  optionKeys?: string[],
+  signal?: AbortSignal
+): Promise<LetterReadResult> {
+  const { result: completion, retries } = await withRetry("logprob-read", () =>
+    client.chat.completions.create({
+      model,
+      messages: [
+        { role: "system", content: prompt.system },
+        { role: "user", content: prompt.user },
+      ],
+      temperature: 0,
+      max_tokens: 4,
+      logprobs: true,
+      top_logprobs: DEFAULT_LOGPROB_TOP_K,
+    } as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
+      { signal })
+  );
+
+  const top = completion.choices?.[0]?.logprobs?.content?.[0]?.top_logprobs ?? [];
+  const parsed = parseLetterLogprobs(
+    top.map((t) => ({ token: t.token, logprob: t.logprob })),
+    optionCount,
+    optionKeys
+  );
+  if (parsed.matched === 0) {
+    throw new Error(
+      "logprob readout: provider returned no usable option logprobs (does it support logprobs?)"
+    );
+  }
+  return {
+    logits: parsed.logits,
+    matched: parsed.matched,
+    tokens_in: completion.usage?.prompt_tokens ?? 0,
+    tokens_out: completion.usage?.completion_tokens ?? 0,
+    retries,
+  };
+}
+
+async function evaluateChoiceLogprob(
+  client: OpenAI,
+  model: string,
+  state: string,
+  name: string,
+  q: Extract<Question, { type: "choice" }>,
+  calibrationT: number,
+  signal?: AbortSignal
+) {
+  const keys = Object.keys(q.criteria);
+  const instructions = q.instructions ?? `Select the best label for "${name}"`;
+  const options = keys.map((k) => ({ key: k, description: q.criteria[k] }));
+  const prompt = buildOptionLetterPrompt(state, instructions, options);
+  const read = await readLetterLogprobs(client, model, prompt, keys.length, keys, signal);
+  const probs = softmaxFromLogits(read.logits, calibrationT);
+
+  const probabilities: Record<string, number> = {};
+  keys.forEach((k, i) => {
+    probabilities[k] = r3(probs[i]);
+  });
+  let bestIdx = 0;
+  for (let i = 1; i < probs.length; i++) if (probs[i] > probs[bestIdx]) bestIdx = i;
+
+  return {
+    answer: {
+      type: "choice" as const,
+      choice: keys[bestIdx],
+      confidence: confidenceFromProbs(probs),
+      probabilities,
+    } satisfies ChoiceAnswer,
+    tokens_in: read.tokens_in,
+    tokens_out: read.tokens_out,
+    retries: read.retries,
+    calls: 1,
+    matched: read.matched,
+  };
+}
+
+async function evaluateScoreLogprob(
+  client: OpenAI,
+  model: string,
+  state: string,
+  name: string,
+  q: Extract<Question, { type: "score" }>,
+  calibrationT: number,
+  signal?: AbortSignal
+) {
+  const levels = q.criteria;
+  const instructions = q.instructions ?? `Rate "${name}"`;
+  const prompt = buildOptionLetterPrompt(
+    state,
+    `${instructions} (levels: ${levels.map((l, i) => `${i}=${l}`).join(", ")})`,
+    levels.map((l) => ({ key: l }))
+  );
+  const read = await readLetterLogprobs(client, model, prompt, levels.length, undefined, signal);
+  const probs = softmaxFromLogits(read.logits, calibrationT);
+
+  let score = 0;
+  probs.forEach((p, i) => {
+    score += p * i;
+  });
+  const legend: Record<string, string> = {};
+  levels.forEach((l, i) => {
+    legend[String(i)] = l;
+  });
+  const probabilityMap: Record<string, number> = {};
+  probs.forEach((p, i) => {
+    probabilityMap[String(i)] = r3(p);
+  });
+
+  return {
+    answer: {
+      type: "score" as const,
+      score: Math.round(score * 100) / 100,
+      confidence: confidenceFromProbs(probs),
+      legend,
+      probabilities: probabilityMap,
+    } satisfies ScoreAnswer,
+    tokens_in: read.tokens_in,
+    tokens_out: read.tokens_out,
+    retries: read.retries,
+    calls: 1,
+    matched: read.matched,
+  };
+}
+
+async function evaluateNoulLogprob(
+  client: OpenAI,
+  model: string,
+  state: string,
+  name: string,
+  q: Extract<Question, { type: "noul" | "boolean" }>,
+  calibrationT: number,
+  signal?: AbortSignal
+) {
+  let statement = q.instructions?.trim() || `The proposition "${name}" is true.`;
+  if (!statement.endsWith("?") && !statement.endsWith(".")) statement += ".";
+
+  // Yes/No tokens usually appear directly in the top-logprobs window; if the
+  // model answered with a letter instead, fall back to A=Yes / B=No parsing.
+  const prompt = buildOptionLetterPrompt(state, statement, [
+    { key: "Yes" },
+    { key: "No" },
+  ]);
+  const { result: read, retries: noulRetries } = await withRetry("logprob-read", () =>
+    client.chat.completions.create({
+      model,
+      messages: [
+        { role: "system", content: prompt.system },
+        { role: "user", content: prompt.user },
+      ],
+      temperature: 0,
+      max_tokens: 4,
+      logprobs: true,
+      top_logprobs: DEFAULT_LOGPROB_TOP_K,
+    } as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
+      { signal })
+  );
+  const top = read.choices?.[0]?.logprobs?.content?.[0]?.top_logprobs ?? [];
+  const yn = parseYesNoLogprobs(
+    top.map((t) => ({ token: t.token, logprob: t.logprob }))
+  );
+
+  let yesLogit: number;
+  let noLogit: number;
+  let matched: number;
+  if (yn.yesLogit === null && yn.noLogit === null) {
+    const parsed = parseLetterLogprobs(
+      top.map((t) => ({ token: t.token, logprob: t.logprob })),
+      2
+    );
+    if (parsed.matched === 0) {
+      throw new Error("logprob readout: no yes/no or A/B tokens in response");
+    }
+    yesLogit = parsed.logits[0];
+    noLogit = parsed.logits[1];
+    matched = parsed.matched;
+  } else {
+    const floor = Math.min(yn.yesLogit ?? 0, yn.noLogit ?? 0) - 5;
+    yesLogit = yn.yesLogit ?? floor;
+    noLogit = yn.noLogit ?? floor;
+    matched = (yn.yesLogit !== null ? 1 : 0) + (yn.noLogit !== null ? 1 : 0);
+  }
+
+  const probs = softmaxFromLogits([yesLogit, noLogit], calibrationT);
+  return {
+    answer: { type: "noul" as const, noul: r3(probs[0]) } satisfies NoulAnswer,
+    tokens_in: read.usage?.prompt_tokens ?? 0,
+    tokens_out: read.usage?.completion_tokens ?? 0,
+    retries: noulRetries,
+    calls: 1,
+    matched,
+  };
+}
+
+// ── micro-scorer readout (one call per option) ─────────────────────────────
 
 async function evaluateChoiceParallel(
   client: OpenAI,
@@ -139,7 +419,9 @@ async function evaluateChoiceParallel(
   state: string,
   name: string,
   q: Extract<Question, { type: "choice" }>,
-  temperature: number
+  temperature: number,
+  calibrationT: number,
+  signal?: AbortSignal
 ) {
   const keys = Object.keys(q.criteria);
   const instructions = q.instructions ?? `Select the best label for "${name}"`;
@@ -150,31 +432,29 @@ async function evaluateChoiceParallel(
         `The correct ${instructions.toLowerCase().replace(/\?$/, "")} is "${key}"` +
         (desc ? ` (${desc})` : "") +
         ".";
-      return scoreProposition(client, model, state, statement, temperature);
+      return scoreProposition(client, model, state, statement, temperature, signal);
     })
   );
-  const probs = scoresToDistribution(results.map((r) => r.probability));
+  const probs = scoresToDistribution(
+    results.map((r) => r.probability),
+    calibrationT
+  );
   const probabilities: Record<string, number> = {};
   keys.forEach((k, i) => {
-    probabilities[k] = Math.round(probs[i] * 1000) / 1000;
+    probabilities[k] = r3(probs[i]);
   });
   let bestIdx = 0;
   for (let i = 1; i < probs.length; i++) if (probs[i] > probs[bestIdx]) bestIdx = i;
-  const sorted = [...probs].sort((a, b) => b - a);
-  const gap = (sorted[0] ?? 0) - (sorted[1] ?? 0);
-  const confidence = Math.min(
-    1,
-    Math.max(0, Math.round((0.5 * (sorted[0] ?? 0) + 0.5 * (gap + 0.5)) * 1000) / 1000)
-  );
   return {
     answer: {
       type: "choice" as const,
       choice: keys[bestIdx],
-      confidence,
+      confidence: confidenceFromProbs(probs),
       probabilities,
-    },
+    } satisfies ChoiceAnswer,
     tokens_in: results.reduce((s, r) => s + r.tokens_in, 0),
     tokens_out: results.reduce((s, r) => s + r.tokens_out, 0),
+    retries: results.reduce((s, r) => s + r.retries, 0),
     calls: keys.length,
   };
 }
@@ -185,17 +465,22 @@ async function evaluateScoreParallel(
   state: string,
   name: string,
   q: Extract<Question, { type: "score" }>,
-  temperature: number
+  temperature: number,
+  calibrationT: number,
+  signal?: AbortSignal
 ) {
   const levels = q.criteria;
   const instructions = q.instructions ?? `Rate "${name}"`;
   const results = await Promise.all(
     levels.map((label, i) => {
       const statement = `On the scale for "${instructions}", the most appropriate rating is level ${i}: "${label}".`;
-      return scoreProposition(client, model, state, statement, temperature);
+      return scoreProposition(client, model, state, statement, temperature, signal);
     })
   );
-  const probs = scoresToDistribution(results.map((r) => r.probability));
+  const probs = scoresToDistribution(
+    results.map((r) => r.probability),
+    calibrationT
+  );
   let score = 0;
   probs.forEach((p, i) => {
     score += p * i;
@@ -207,24 +492,19 @@ async function evaluateScoreParallel(
   });
   const probabilityMap: Record<string, number> = {};
   probs.forEach((p, i) => {
-    probabilityMap[String(i)] = Math.round(p * 1000) / 1000;
+    probabilityMap[String(i)] = r3(p);
   });
-  const sorted = [...probs].sort((a, b) => b - a);
-  const gap = (sorted[0] ?? 0) - (sorted[1] ?? 0);
-  const confidence = Math.min(
-    1,
-    Math.max(0, Math.round((0.5 * (sorted[0] ?? 0) + 0.5 * (gap + 0.5)) * 1000) / 1000)
-  );
   return {
     answer: {
       type: "score" as const,
       score,
-      confidence,
+      confidence: confidenceFromProbs(probs),
       legend,
       probabilities: probabilityMap,
-    },
+    } satisfies ScoreAnswer,
     tokens_in: results.reduce((s, r) => s + r.tokens_in, 0),
     tokens_out: results.reduce((s, r) => s + r.tokens_out, 0),
+    retries: results.reduce((s, r) => s + r.retries, 0),
     calls: levels.length,
   };
 }
@@ -235,25 +515,248 @@ async function evaluateNoulParallel(
   state: string,
   name: string,
   q: Extract<Question, { type: "noul" | "boolean" }>,
-  temperature: number
+  temperature: number,
+  signal?: AbortSignal
 ) {
   let statement = q.instructions?.trim() || `The proposition "${name}" is true.`;
   if (!statement.endsWith("?") && !statement.endsWith(".")) statement += ".";
-  const result = await scoreProposition(client, model, state, statement, temperature);
+  const result = await scoreProposition(client, model, state, statement, temperature, signal);
   return {
-    answer: { type: "noul" as const, noul: Math.round(result.probability * 1000) / 1000 },
+    answer: { type: "noul" as const, noul: r3(result.probability) } satisfies NoulAnswer,
     tokens_in: result.tokens_in,
     tokens_out: result.tokens_out,
+    retries: result.retries,
     calls: 1,
   };
 }
+
+// ── parallel dispatch: per-question readout with degradation ───────────────
+
+interface ParallelOutcome {
+  answers: Record<string, Answer>;
+  tokens_in: number;
+  tokens_out: number;
+  calls: number;
+  retries: number;
+  readout: "logprob" | "micro";
+  matchedLetters?: number;
+  /** Questions that had to use their second-choice readout. */
+  fallbackQuestions: number;
+  /** Questions no readout could answer (they carry neutral placeholders). */
+  failedQuestions: string[];
+}
+
+type ParallelReadout = "logprob" | "micro";
+
+interface QuestionOutcome {
+  answer: Answer;
+  tokens_in: number;
+  tokens_out: number;
+  retries: number;
+  calls: number;
+  readout?: ParallelReadout;
+  matched?: number;
+}
+
+async function readQuestionOnce(
+  client: OpenAI,
+  model: string,
+  stateStr: string,
+  name: string,
+  q: Question,
+  temperature: number,
+  calibrationT: number,
+  readout: ParallelReadout,
+  signal?: AbortSignal
+): Promise<QuestionOutcome> {
+  if (readout === "logprob") {
+    if (q.type === "choice") {
+      return await evaluateChoiceLogprob(client, model, stateStr, name, q, calibrationT, signal);
+    }
+    if (q.type === "score") {
+      return await evaluateScoreLogprob(client, model, stateStr, name, q, calibrationT, signal);
+    }
+    return await evaluateNoulLogprob(client, model, stateStr, name, q, calibrationT, signal);
+  }
+  if (q.type === "choice") {
+    return await evaluateChoiceParallel(
+      client,
+      model,
+      stateStr,
+      name,
+      q,
+      temperature,
+      calibrationT,
+      signal
+    );
+  }
+  if (q.type === "score") {
+    return await evaluateScoreParallel(
+      client,
+      model,
+      stateStr,
+      name,
+      q,
+      temperature,
+      calibrationT,
+      signal
+    );
+  }
+  return await evaluateNoulParallel(client, model, stateStr, name, q, temperature, signal);
+}
+
+/**
+ * Run one question through its readout chain: the requested readout first,
+ * then the other one. Throws only when every readout for this question fails.
+ */
+async function evaluateQuestionWithFallback(
+  client: OpenAI,
+  model: string,
+  stateStr: string,
+  name: string,
+  q: Question,
+  temperature: number,
+  calibrationT: number,
+  requested: ParallelReadout,
+  signal?: AbortSignal
+): Promise<QuestionOutcome & { degraded: boolean }> {
+  const order: ParallelReadout[] = requested === "micro" ? ["micro"] : ["logprob", "micro"];
+  let lastErr: unknown;
+  for (let i = 0; i < order.length; i++) {
+    const readout = order[i];
+    try {
+      const out = await readQuestionOnce(
+        client,
+        model,
+        stateStr,
+        name,
+        q,
+        temperature,
+        calibrationT,
+        readout,
+        signal
+      );
+      return { ...out, readout, degraded: i > 0 };
+    } catch (err) {
+      lastErr = err;
+      console.warn(
+        `[openjev] question "${name}" via ${readout} failed: ${
+          err instanceof Error ? err.message : String(err)
+        }${i + 1 < order.length ? ` — degrading to ${order[i + 1]}` : ""}`
+      );
+    }
+  }
+  throw lastErr;
+}
+
+/** Uniform-probability answer of the right shape, used when all readouts fail. */
+function neutralAnswerFor(q: Question): Answer {
+  if (q.type === "choice") return neutralChoiceAnswer(Object.keys(q.criteria));
+  if (q.type === "score") return neutralScoreAnswer(q.criteria);
+  return { type: "noul", noul: 0.5 };
+}
+
+async function evaluateParallelQuestions(
+  client: OpenAI,
+  model: string,
+  stateStr: string,
+  questions: Questions,
+  temperature: number,
+  calibrationT: number,
+  requested: ParallelReadout,
+  signal?: AbortSignal
+): Promise<ParallelOutcome> {
+  const entries = Object.entries(questions);
+  const settled = await limitConcurrency(
+    entries,
+    perRequestConcurrency(),
+    async ([name, q]) => {
+      try {
+        return {
+          name,
+          ok: true as const,
+          ...(await evaluateQuestionWithFallback(
+            client,
+            model,
+            stateStr,
+            name,
+            q,
+            temperature,
+            calibrationT,
+            requested,
+            signal
+          )),
+        };
+      } catch (err) {
+        return { name, ok: false as const, err, answer: neutralAnswerFor(q) };
+      }
+    }
+  );
+
+  const failed = settled.filter((s) => !s.ok);
+  if (failed.length === settled.length && settled.length > 0) {
+    const first = failed[0]?.err;
+    throw new Error(
+      `all ${settled.length} question(s) failed: ${
+        first instanceof Error ? first.message : String(first)
+      }`
+    );
+  }
+
+  const answers: Record<string, Answer> = {};
+  let tokens_in = 0;
+  let tokens_out = 0;
+  let calls = 0;
+  let retries = 0;
+  let matchedLetters: number | undefined;
+  let fallbackQuestions = 0;
+  const failedQuestions: string[] = [];
+  let anyDegraded = false;
+  let allMicro = true;
+  for (const s of settled) {
+    answers[s.name] = s.answer;
+    if (!s.ok) {
+      failedQuestions.push(s.name);
+      continue; // neutral placeholder — no tokens or calls to report
+    }
+    if (s.degraded) fallbackQuestions++;
+    anyDegraded = anyDegraded || s.degraded;
+    allMicro = allMicro && s.readout === "micro";
+    tokens_in += s.tokens_in;
+    tokens_out += s.tokens_out;
+    calls += s.calls;
+    retries += s.retries;
+    if (s.readout === "logprob" && typeof s.matched === "number") {
+      matchedLetters = (matchedLetters ?? 0) + s.matched;
+    }
+  }
+  // Report the readout that actually produced the answers: when every
+  // question had to degrade, "micro" is the honest label; mixed batches keep
+  // the requested readout with fallback_questions conveying the split.
+  const effectiveReadout: ParallelReadout =
+    allMicro && anyDegraded ? "micro" : requested;
+  return {
+    answers,
+    tokens_in,
+    tokens_out,
+    calls,
+    retries,
+    readout: effectiveReadout,
+    matchedLetters,
+    fallbackQuestions,
+    failedQuestions,
+  };
+}
+
+// ── oneshot backend ────────────────────────────────────────────────────────
 
 async function evaluateOneshot(
   client: OpenAI,
   model: string,
   state: string,
   questions: Questions,
-  temperature: number
+  temperature: number,
+  signal?: AbortSignal
 ) {
   const questionDescriptions: string[] = [];
   for (const [name, q] of Object.entries(questions)) {
@@ -283,7 +786,7 @@ async function evaluateOneshot(
     ],
     temperature,
     response_format: { type: "json_object" },
-  });
+  } as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming, { signal });
 
   const content = completion.choices[0]?.message?.content ?? "{}";
   let parsed: Record<string, Record<string, unknown>> = {};
@@ -333,6 +836,41 @@ async function evaluateOneshot(
   };
 }
 
+/** Temperature-scale the choice probabilities returned by the oneshot backend. */
+function calibrateOneshotAnswer(
+  answer: Answer,
+  calibrationT: number
+): Answer {
+  if (calibrationT === 1) return answer;
+  if (answer.type === "choice" && answer.probabilities) {
+    const keys = Object.keys(answer.probabilities);
+    const scaled = temperatureScaleProbs(
+      keys.map((k) => answer.probabilities![k]),
+      calibrationT
+    );
+    const probabilities: Record<string, number> = {};
+    keys.forEach((k, i) => {
+      probabilities[k] = r3(scaled[i]);
+    });
+    return { ...answer, probabilities, confidence: confidenceFromProbs(scaled) };
+  }
+  if (answer.type === "score" && answer.probabilities) {
+    const keys = Object.keys(answer.probabilities);
+    const scaled = temperatureScaleProbs(
+      keys.map((k) => answer.probabilities![k]),
+      calibrationT
+    );
+    const probabilities: Record<string, number> = {};
+    keys.forEach((k, i) => {
+      probabilities[k] = r3(scaled[i]);
+    });
+    return { ...answer, probabilities, confidence: confidenceFromProbs(scaled) };
+  }
+  return answer;
+}
+
+// ── decider backend (unchanged wire format) ────────────────────────────────
+
 /**
  * Call Mapika/decider HTTP server (TypeSafe wire format).
  * https://github.com/Mapika/decider — scripts/serve.sh Mapika/decider-2b 8000
@@ -341,7 +879,8 @@ async function evaluateDecider(
   state: string | Record<string, unknown> | unknown[],
   questions: Questions,
   deciderUrl: string,
-  apiKey?: string
+  apiKey?: string,
+  signal?: AbortSignal
 ): Promise<{
   answers: Record<string, Answer>;
   model: string;
@@ -367,11 +906,16 @@ async function evaluateDecider(
     model: "decider",
   };
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-  });
+  const { result: res } = await withRetry("decider", () =>
+    fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(30_000)])
+        : AbortSignal.timeout(30_000),
+    })
+  );
 
   const text = await res.text();
   if (!res.ok) {
@@ -444,17 +988,22 @@ async function evaluateDecider(
   };
 }
 
+// ── entrypoint ─────────────────────────────────────────────────────────────
+
 export async function evaluate(req: EvaluateRequest): Promise<EvaluateResponse> {
   const t0 = Date.now();
   const {
     state,
     questions,
-    model = "gpt-4o-mini",
+    model = process.env.OPENJEV_MODEL || "gpt-4o-mini",
     base_url,
     api_key,
     temperature = 0,
     mode = "parallel",
     decider_url,
+    calibration_temperature,
+    readout,
+    signal,
   } = req;
 
   if (!questions || Object.keys(questions).length === 0) {
@@ -468,7 +1017,7 @@ export async function evaluate(req: EvaluateRequest): Promise<EvaluateResponse> 
       process.env.DECIDER_BASE_URL ||
       "http://localhost:8000";
 
-    const result = await evaluateDecider(state, questions, url, api_key);
+    const result = await evaluateDecider(state, questions, url, api_key, signal);
 
     return {
       model: result.model,
@@ -489,88 +1038,65 @@ export async function evaluate(req: EvaluateRequest): Promise<EvaluateResponse> 
   const stateStr =
     typeof state === "string" ? state : JSON.stringify(state, null, 2);
   const client = makeClient(api_key, base_url);
+  const calibrationT = resolveCalibrationT(
+    calibration_temperature,
+    process.env.OPENJEV_CALIBRATION_T
+  );
 
   if (mode === "parallel") {
-    const settled = await Promise.all(
-      Object.entries(questions).map(async ([name, q]) => {
-        if (q.type === "choice") {
-          return {
-            name,
-            ...(await evaluateChoiceParallel(
-              client,
-              model,
-              stateStr,
-              name,
-              q,
-              temperature
-            )),
-          };
-        }
-        if (q.type === "score") {
-          return {
-            name,
-            ...(await evaluateScoreParallel(
-              client,
-              model,
-              stateStr,
-              name,
-              q,
-              temperature
-            )),
-          };
-        }
-        return {
-          name,
-          ...(await evaluateNoulParallel(
-            client,
-            model,
-            stateStr,
-            name,
-            q,
-            temperature
-          )),
-        };
-      })
-    );
+    const requested: ParallelReadout =
+      readout ?? (process.env.OPENJEV_PARALLEL_MODE as ParallelReadout) ?? "logprob";
 
-    const answers: Record<string, Answer> = {};
-    let tokens_in = 0;
-    let tokens_out = 0;
-    let parallel_calls = 0;
-    for (const s of settled) {
-      answers[s.name] = s.answer;
-      tokens_in += s.tokens_in;
-      tokens_out += s.tokens_out;
-      parallel_calls += s.calls;
-    }
+    const outcome = await evaluateParallelQuestions(
+      client,
+      model,
+      stateStr,
+      questions,
+      temperature,
+      calibrationT,
+      requested,
+      signal
+    );
 
     return {
       model,
-      answers,
+      answers: outcome.answers,
       usage: {
-        input_tokens: tokens_in || null,
-        output_tokens: tokens_out || null,
+        input_tokens: outcome.tokens_in || null,
+        output_tokens: outcome.tokens_out || null,
       },
       meta: {
         mode: "parallel",
         latency_ms: Date.now() - t0,
-        parallel_calls,
+        parallel_calls: outcome.calls,
         backend: "openai-compatible",
+        readout: outcome.readout,
+        calibration_t: calibrationT,
+        fallback_used:
+          outcome.fallbackQuestions > 0 ? "per-question degradation" : null,
+        fallback_questions: outcome.fallbackQuestions > 0 ? outcome.fallbackQuestions : undefined,
+        failed_questions: outcome.failedQuestions.length
+          ? outcome.failedQuestions
+          : undefined,
+        retries: outcome.retries,
+        ...(outcome.matchedLetters !== undefined
+          ? { matched_letters: outcome.matchedLetters }
+          : {}),
       },
     };
   }
 
-  const oneshot = await evaluateOneshot(
-    client,
-    model,
-    stateStr,
-    questions,
-    temperature
+  const { result: oneshot, retries } = await withRetry("oneshot", () =>
+    evaluateOneshot(client, model, stateStr, questions, temperature, signal)
   );
+  const answers: Record<string, Answer> = {};
+  for (const [name, answer] of Object.entries(oneshot.answers)) {
+    answers[name] = calibrateOneshotAnswer(answer, calibrationT);
+  }
 
   return {
     model,
-    answers: oneshot.answers,
+    answers,
     usage: {
       input_tokens: oneshot.tokens_in || null,
       output_tokens: oneshot.tokens_out || null,
@@ -580,6 +1106,9 @@ export async function evaluate(req: EvaluateRequest): Promise<EvaluateResponse> 
       latency_ms: Date.now() - t0,
       parallel_calls: oneshot.calls,
       backend: "openai-compatible",
+      readout: "json",
+      calibration_t: calibrationT,
+      retries,
     },
   };
 }
