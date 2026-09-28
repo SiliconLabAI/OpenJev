@@ -33,6 +33,21 @@ export interface EvaluateRequest {
   mode?: BackendMode;
   /** Override for Mapika/decider server, e.g. http://localhost:8000 */
   decider_url?: string;
+  /**
+   * Temperature-scaling calibration for softmax probabilities.
+   * Falls back to env OPENJEV_CALIBRATION_T, then 1 (no rescaling).
+   */
+  calibration_temperature?: number;
+  /**
+   * Parallel readout strategy: "logprob" (one call per question, default)
+   * or "micro" (legacy one call per option).
+   */
+  readout?: "logprob" | "micro";
+  /**
+   * Abort signal propagated from the HTTP request (server-internal; never
+   * sent by clients). Aborted requests stop issuing LLM calls.
+   */
+  signal?: AbortSignal;
 }
 
 export interface ChoiceAnswer {
@@ -66,6 +81,20 @@ export interface EvaluateResponse {
     latency_ms: number;
     parallel_calls: number;
     backend?: string;
+    /** Which parallel readout actually produced the answers. */
+    readout?: "logprob" | "micro" | "json";
+    /** Calibration temperature applied (1 = none). */
+    calibration_t?: number;
+    /** Label of the fallback step used, if the primary readout failed. */
+    fallback_used?: string | null;
+    /** Total SDK-level retries consumed across calls. */
+    retries?: number;
+    /** Options matched in the top-logprobs window (logprob readout). */
+    matched_letters?: number;
+    /** Questions that needed a lower readout than requested. */
+    fallback_questions?: number;
+    /** Questions no readout could answer; they carry neutral placeholder answers. */
+    failed_questions?: string[];
   };
   error?: string;
 }

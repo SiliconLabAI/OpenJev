@@ -5,4 +5,6 @@ dist
 *.log
 .DS_Store
 .vite/*temp*
-package-lock.json
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/

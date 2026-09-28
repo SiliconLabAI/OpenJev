@@ -1,0 +1,11 @@
+{
+  "model": "mock",
+  "created_at": "2026-09-28T05:06:15.537Z",
+  "dataset_path": "eval/golden/dataset.jsonl",
+  "metrics": {
+    "questions_scored": 22,
+    "accuracy": 0.3181818181818182,
+    "brier": 0.6439394545454546,
+    "ece": 0.08327272727272728
+  }
+}

@@ -3,11 +3,18 @@
   "version": "1.1.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "tsx watch server/index.ts",
     "build": "vite build",
     "start": "NODE_ENV=production tsx server/index.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/lib/*.test.ts",
+    "calibrate": "tsx scripts/calibrate.ts",
+    "position-bias": "tsx scripts/position-bias.ts",
+    "eval:golden": "tsx scripts/eval-golden.ts eval/golden/dataset.jsonl"
   },
   "dependencies": {
     "cors": "^2.8.5",
