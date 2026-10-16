@@ -135,7 +135,13 @@ OPENAI_API_KEY=
 # decider backend
 DECIDER_BASE_URL=http://localhost:8000
 # DECIDER_API_KEY=local
+
+# Exact browser origins that may read API responses (comma-separated).
+# Leave unset to deny every cross-origin browser. The playground is same-origin, so it needs no entry.
+# CORS_ALLOWED_ORIGINS=
 ```
+
+`CORS_ALLOWED_ORIGINS` is an exact allowlist (`scheme://host:port`). An unset or empty value denies cross-origin browsers and does not send `Access-Control-Allow-Origin: *`. Requests without an `Origin` header, including `curl`, still reach the API. `*` is not a wildcard.
 
 ## Layout
 

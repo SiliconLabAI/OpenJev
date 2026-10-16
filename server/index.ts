@@ -1,6 +1,7 @@
 import "./loadEnv";
 import express from "express";
 import cors from "cors";
+import { createCorsOptions } from "./cors";
 import path from "path";
 import { fileURLToPath } from "url";
 import { createServer as createViteServer } from "vite";
@@ -13,7 +14,7 @@ const PORT = Number(process.env.PORT) || 3001;
 
 async function main() {
   const app = express();
-  app.use(cors());
+  app.use(cors(createCorsOptions(process.env.CORS_ALLOWED_ORIGINS)));
   app.use(express.json({ limit: "2mb" }));
 
   console.log(
